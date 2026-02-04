@@ -1,0 +1,35 @@
+name: Techpresso Korean PDF
+
+on:
+  schedule:
+    - cron: "30 0 * * 1-6"  # Mon-Sat 00:30 UTC = 09:30 KST
+  workflow_dispatch:
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run script
+        env:
+          RSS_URL: "https://rss.beehiiv.com/feeds/ez2zQOMePQ.xml"
+          SMTP_HOST: "smtp.gmail.com"
+          SMTP_PORT: "465"
+          SMTP_USER: ${{ secrets.SMTP_USER }}
+          SMTP_PASS: ${{ secrets.SMTP_PASS }}
+          MAIL_FROM: ${{ secrets.MAIL_FROM }}
+          MAIL_TO: ${{ secrets.MAIL_TO }}
+        run: |
+          python main.py
