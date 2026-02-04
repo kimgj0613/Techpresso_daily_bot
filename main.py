@@ -28,6 +28,9 @@ MAIL_BODY_LINE = "OneSip – Your daily tech clarity"
 BRAND_FROM = "Techpresso"
 BRAND_TO = "OneSip"
 
+# 디버그: GitHub Actions 아티팩트로 확인하고 싶으면 1로 설정
+DEBUG_DUMP_HTML = os.getenv("DEBUG_DUMP_HTML", "0") == "1"
+
 KST = tz.gettz("Asia/Seoul")
 
 translator = None
@@ -61,17 +64,12 @@ def safe_print_deepl_usage():
 # DeepL 번역 (긴 텍스트 안정 처리)
 # ======================
 def _split_by_paragraph(text: str, max_chars: int = 4500):
-    """
-    DeepL 호출 안정성을 위해 문단 기준으로 쪼개기.
-    (문단 하나가 너무 길면 강제 분할)
-    """
     text = (text or "").strip()
     if not text:
         return []
 
     paras = [p.strip() for p in re.split(r"\n{2,}", text) if p.strip()]
-    chunks = []
-    buf = ""
+    chunks, buf = [], ""
 
     for p in paras:
         add = p + "\n\n"
@@ -80,7 +78,6 @@ def _split_by_paragraph(text: str, max_chars: int = 4500):
         else:
             if buf.strip():
                 chunks.append(buf.strip())
-            # 문단 하나가 max_chars를 초과하면 강제 분할
             if len(add) > max_chars:
                 for i in range(0, len(add), max_chars):
                     part = add[i : i + max_chars].strip()
@@ -97,11 +94,6 @@ def _split_by_paragraph(text: str, max_chars: int = 4500):
 
 
 def translate_text(text: str, retries: int = 3) -> str:
-    """
-    - DeepL만 사용
-    - source_lang 고정하지 않고 자동 감지(혼합 텍스트 안정)
-    - 긴 텍스트는 문단 chunk로 나눠 번역
-    """
     if not text or not text.strip():
         return text
 
@@ -136,60 +128,64 @@ def translate_text(text: str, retries: int = 3) -> str:
 # ======================
 # HTML 정리/브랜딩/번역
 # ======================
-def _remove_techpresso_header_footer(soup: BeautifulSoup):
+REMOVE_KEYWORDS = [
+    "Join Free",
+    "Upgrade",
+    "Together with",
+    "this is your daily",
+    "Not subscribed to",
+    "Subscribe for free",
+    "Advertise",
+    "Feedback",
+    "Read Online",
+]
+
+
+def _match_keyword_count(text: str) -> int:
+    t = (text or "").lower()
+    return sum(1 for k in REMOVE_KEYWORDS if k.lower() in t)
+
+
+def _remove_techpresso_header_footer_safely(soup: BeautifulSoup):
     """
-    Beehiiv 공통 헤더/푸터(Join Free/Upgrade/Subscribe 등) 제거.
-    클래스가 자주 바뀌므로 텍스트 패턴 기반으로 제거.
+    ⚠️ 핵심: '큰 부모 컨테이너'를 날리면 본문까지 삭제되어 PDF가 빈 페이지가 됨.
+    그래서 '키워드가 포함되면서 텍스트가 짧은 블록'만 제거한다.
+    Beehiiv은 table 기반인 경우가 많아서 table/tr/td도 포함.
     """
+    candidates = soup.find_all(["header", "footer", "div", "section", "table", "tr", "td"])
 
-    # 제거 판단에 쓰는 키워드(대체로 헤더/푸터에만 존재)
-    keywords = [
-        "Join Free",
-        "Upgrade",
-        "Together with",
-        "this is your daily",
-        "Not subscribed to",
-        "Subscribe for free",
-        "Advertise",
-        "Feedback",
-        "Read Online",
-    ]
-    kw_lower = [k.lower() for k in keywords]
-
-    def match_score(text: str) -> int:
-        t = (text or "").lower()
-        score = 0
-        for k in kw_lower:
-            if k in t:
-                score += 1
-        return score
-
-    # 1) header/footer 태그는 우선 제거 시도
-    for tag in soup.find_all(["header", "footer"]):
+    for tag in candidates:
         text = tag.get_text(" ", strip=True)
-        if match_score(text) >= 1:
-            tag.decompose()
+        if not text:
+            continue
 
-    # 2) div/section 중에서도 헤더/푸터 블록이 포함된 컨테이너 제거
-    #    오탐을 줄이기 위해 '2개 이상' 키워드 매칭일 때 제거
-    for tag in soup.find_all(["div", "section"]):
-        text = tag.get_text(" ", strip=True)
-        if match_score(text) >= 2:
+        kw = _match_keyword_count(text)
+
+        # 안전장치 1) 키워드가 아예 없으면 패스
+        if kw == 0:
+            continue
+
+        # 안전장치 2) 너무 긴 블록(본문 포함 가능성)을 삭제하지 않음
+        # 헤더/푸터는 보통 짧기 때문에 1200~2000 사이가 안전
+        if len(text) > 1600:
+            continue
+
+        # 안전장치 3) div/section/table/tr/td는 최소 2개 이상 키워드가 잡힐 때만 삭제
+        if tag.name in ["div", "section", "table", "tr", "td"]:
+            if kw >= 2:
+                tag.decompose()
+        else:
+            # header/footer는 1개만 잡혀도 삭제
             tag.decompose()
 
 
 def _replace_brand_everywhere(soup: BeautifulSoup, old: str, new: str):
-    # 텍스트 노드 전체 치환
     for t in soup.find_all(string=True):
         if old in t:
             t.replace_with(t.replace(old, new))
 
 
 def _append_link_hrefs_if_any(tag):
-    """
-    번역 과정에서 a 태그 구조가 사라질 수 있으므로 URL을 괄호로 덧붙여
-    링크 정보 손실을 최소화.
-    """
     links = []
     for a in tag.find_all("a", href=True):
         href = (a.get("href") or "").strip()
@@ -198,39 +194,69 @@ def _append_link_hrefs_if_any(tag):
     return links
 
 
-def translate_html_preserve_layout(html: str) -> str:
-    soup = BeautifulSoup(html, "html.parser")
-
-    # (1) Beehiiv 공통 헤더/푸터 제거
-    _remove_techpresso_header_footer(soup)
-
-    # (2) 광고/스폰서/광고 영역 제거(있으면)
-    for ad in soup.select("[data-testid='ad'], .sponsor, .advertisement"):
-        ad.decompose()
-
-    # (3) 브랜딩 치환 (Techpresso -> OneSip)
-    _replace_brand_everywhere(soup, BRAND_FROM, BRAND_TO)
-
-    # (4) 문단/리스트/헤더만 번역
+def _translate_blocks_in_soup(soup: BeautifulSoup) -> BeautifulSoup:
     for tag in soup.find_all(["p", "li", "h1", "h2", "h3"]):
-        text = tag.get_text(" ", strip=True)  # 공백 유지
+        text = tag.get_text(" ", strip=True)  # 공백 보존
 
         if len(text) < 5:
             continue
 
-        # 링크 URL 보존
         hrefs = _append_link_hrefs_if_any(tag)
-
         translated = translate_text(text)
 
-        # 링크 URL 덧붙이기
         if hrefs:
             translated += "\n" + "\n".join([f"({u})" for u in hrefs])
 
         tag.clear()
         tag.append(translated)
 
-    return str(soup)
+    return soup
+
+
+def translate_html_preserve_layout(html: str, date_str: str) -> str:
+    """
+    1) 안전하게 헤더/푸터 제거
+    2) 브랜딩 치환
+    3) 번역
+    4) 만약 결과가 비면(=본문이 삭제됨) 제거 없이 다시 번역하는 fallback
+    """
+    soup = BeautifulSoup(html, "html.parser")
+
+    # 1) 헤더/푸터 안전 제거
+    _remove_techpresso_header_footer_safely(soup)
+
+    # 2) 광고 제거(있으면)
+    for ad in soup.select("[data-testid='ad'], .sponsor, .advertisement"):
+        ad.decompose()
+
+    # 3) 브랜딩 치환
+    _replace_brand_everywhere(soup, BRAND_FROM, BRAND_TO)
+
+    # 4) 번역
+    soup = _translate_blocks_in_soup(soup)
+    out_html = str(soup)
+
+    # ---- 빈 페이지 방지: 본문이 사실상 사라졌으면 fallback ----
+    # (p/li/h1~h3가 거의 없거나, 결과 텍스트가 너무 짧으면 실패로 간주)
+    text_len = len(BeautifulSoup(out_html, "html.parser").get_text(" ", strip=True))
+    if text_len < 200:
+        print("WARNING: HTML content too small after cleanup. Falling back without header/footer removal.")
+
+        soup2 = BeautifulSoup(html, "html.parser")
+        # 광고만 제거
+        for ad in soup2.select("[data-testid='ad'], .sponsor, .advertisement"):
+            ad.decompose()
+        _replace_brand_everywhere(soup2, BRAND_FROM, BRAND_TO)
+        soup2 = _translate_blocks_in_soup(soup2)
+        out_html = str(soup2)
+
+    # 디버그용 HTML 덤프
+    if DEBUG_DUMP_HTML:
+        with open(f"debug_onesip_{date_str}.html", "w", encoding="utf-8") as f:
+            f.write(out_html)
+        print("Wrote debug HTML:", f"debug_onesip_{date_str}.html")
+
+    return out_html
 
 
 # ======================
@@ -317,7 +343,14 @@ def main():
         print("No issue found today.")
         return
 
-    translated_html = translate_html_preserve_layout(raw_html)
+    translated_html = translate_html_preserve_layout(raw_html, date_str)
+
+    # 추가 안전장치: 최종 HTML 텍스트가 너무 짧으면 중단(빈 PDF 방지)
+    final_text_len = len(BeautifulSoup(translated_html, "html.parser").get_text(" ", strip=True))
+    print("Final HTML text length:", final_text_len)
+    if final_text_len < 200:
+        raise RuntimeError("Final HTML seems empty. Aborting to avoid blank PDF.")
+
     pdf_path = html_to_pdf(translated_html, date_str)
     send_email(pdf_path, date_str)
 
