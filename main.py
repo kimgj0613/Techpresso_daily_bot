@@ -11,6 +11,7 @@ from email.message import EmailMessage
 import deepl
 
 
+
 # ======================
 # 기본 설정
 # ======================
@@ -209,7 +210,7 @@ def _remove_techpresso_header_footer_safely(soup: BeautifulSoup):
 def _remove_blocks_by_keywords_smallest_container(soup: BeautifulSoup, keywords, max_container_len=9000):
     """
     keywords가 포함된 위치에서 td/tr/div/section/table 중 "가장 작은 컨테이너"를 골라 제거.
-    큰 outer table을 날려서 본문이 통째로 사라지는 문제를 방지.
+    NavigableString에 find_parent를 직접 호출하지 않도록 안전 처리.
     """
     lowered = [k.lower() for k in keywords]
 
@@ -218,39 +219,52 @@ def _remove_blocks_by_keywords_smallest_container(soup: BeautifulSoup, keywords,
         return any(k in t for k in lowered)
 
     removed = 0
+
+    # soup.find_all(string=True)는 NavigableString을 반환
     for node in list(soup.find_all(string=True)):
-        if not isinstance(node, str):
+        if not isinstance(node, NavigableString):
             continue
-        if not has_kw(node):
+
+        text = str(node)
+        if not text or not text.strip():
+            continue
+
+        if not has_kw(text):
+            continue
+
+        # ✅ 핵심: 탐색은 항상 parent(Tag)에서 시작
+        parent = getattr(node, "parent", None)
+        if not isinstance(parent, Tag):
             continue
 
         candidates = []
         for name in ["td", "tr", "div", "section", "table"]:
-            anc = node.find_parent(name)
+            anc = parent if parent.name == name else parent.find_parent(name)
             if not anc:
                 continue
+
             txt = anc.get_text(" ", strip=True)
             if not txt:
                 continue
+
             # 너무 큰 컨테이너는 "메일 전체"일 가능성 ↑
             if len(txt) > max_container_len:
                 continue
+
             candidates.append((len(txt), anc))
 
         if not candidates:
-            # 그래도 없으면 텍스트 노드의 부모만 제거(최후의 수단)
-            parent = node.parent
-            if parent and getattr(parent, "decompose", None):
-                parent.decompose()
-                removed += 1
+            # 최후의 수단: parent만 제거
+            parent.decompose()
+            removed += 1
             continue
 
-        # 가장 작은 블록을 삭제
         candidates.sort(key=lambda x: x[0])
         candidates[0][1].decompose()
         removed += 1
 
     return removed
+
 
 
 
