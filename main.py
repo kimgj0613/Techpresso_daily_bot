@@ -158,6 +158,11 @@ def main():
         print("Sunday – skipped")
         return
 
+    # ✅ DeepL 사용량 로그 (여기에 추가)
+    if translator:
+        usage = translator.get_usage()
+        print(f"DeepL usage: {usage.character.count}/{usage.character.limit}")
+    
     date_str = now_kst().strftime("%Y-%m-%d")
 
     raw_html = fetch_today_html()
