@@ -286,8 +286,9 @@ def _remove_partner_sections_only(soup: BeautifulSoup):
 
 def _remove_header_footer_by_markers(soup: BeautifulSoup):
     """
-    헤더/푸터를 '대표 문구' 기반으로 제거.
-    기존 _remove_techpresso_header_footer_safely()가 길이 제한 때문에 놓치는 케이스 보완.
+    헤더/푸터를 '대표 문구' 기반으로 제거 (NavigableString 안전 처리 버전)
+    - 텍스트 노드에서 직접 find_parent를 호출하지 않고
+      항상 parent(Tag)에서 탐색을 시작한다.
     """
     header_markers = [
         "join free",
@@ -321,15 +322,21 @@ def _remove_header_footer_by_markers(soup: BeautifulSoup):
         if not (is_header or is_footer):
             continue
 
+        # ✅ 핵심: parent(Tag)에서부터만 올라가기
+        parent = getattr(node, "parent", None)
+        if parent is None or not getattr(parent, "find_parent", None):
+            continue
+
         candidates = []
-        for name in ("tr","td","table","div","section"):
-            anc = node.find_parent(name)
+        for name in ("tr", "td", "table", "div", "section"):
+            anc = parent if getattr(parent, "name", None) == name else parent.find_parent(name)
             if not anc:
                 continue
             a_txt = anc.get_text(" ", strip=True)
             if not a_txt:
                 continue
             l = len(a_txt)
+            # 너무 큰 wrapper는 피함
             if 80 < l < 30000:
                 candidates.append((l, anc))
 
@@ -347,6 +354,7 @@ def _remove_header_footer_by_markers(soup: BeautifulSoup):
         print("Header blocks removed (marker-based):", removed_header)
     if removed_footer:
         print("Footer blocks removed (marker-based):", removed_footer)
+
 
 
 def _remove_blocks_containing_keywords_safely(soup: BeautifulSoup, keywords):
