@@ -6,6 +6,7 @@ from datetime import datetime, timezone
 from dateutil import tz
 from bs4 import BeautifulSoup
 from bs4 import NavigableString
+from bs4.element import Tag
 from weasyprint import HTML
 import smtplib, ssl
 from email.message import EmailMessage
@@ -221,6 +222,133 @@ def _remove_techpresso_header_footer_safely(soup: BeautifulSoup):
             tag.decompose()
 
 
+
+def _remove_partner_sections_only(soup: BeautifulSoup):
+    """
+    'FROM OUR PARTNER' 섹션을 통째로 제거.
+    - 'FROM OUR PARTNER' 텍스트 노드를 찾는다(대소문자/공백 변형 허용)
+    - 우선 가장 가까운 table을 제거(파트너 블록은 대부분 table 래핑)
+    - table이 너무 크면(tr/td/div/section/table 중) 가장 작은 컨테이너를 제거
+    """
+    removed = 0
+
+    def _smallest_container(from_node, names=("td","tr","div","section","table"), min_len=200, max_len=30000):
+        candidates = []
+        for n in names:
+            anc = from_node.find_parent(n)
+            if not anc:
+                continue
+            txt = anc.get_text(" ", strip=True)
+            if not txt:
+                continue
+            l = len(txt)
+            if l < min_len or l > max_len:
+                continue
+            candidates.append((l, anc))
+        if not candidates:
+            return None
+        candidates.sort(key=lambda x: x[0])
+        return candidates[0][1]
+
+    while True:
+        hit = None
+        for node in list(soup.find_all(string=True)):
+            t = re.sub(r"\s+", " ", str(node)).strip().upper()
+            if t == "FROM OUR PARTNER":
+                hit = node
+                break
+        if hit is None:
+            break
+
+        table = hit.find_parent("table")
+        if table:
+            tlen = len(table.get_text(" ", strip=True))
+            if 500 < tlen < 30000:
+                table.decompose()
+                removed += 1
+                continue
+
+        target = _smallest_container(hit)
+        if target:
+            target.decompose()
+            removed += 1
+            continue
+
+        parent = getattr(hit, "parent", None)
+        if getattr(parent, "decompose", None):
+            parent.decompose()
+            removed += 1
+        else:
+            break
+
+    print("Partner blocks removed:", removed)
+
+
+def _remove_header_footer_by_markers(soup: BeautifulSoup):
+    """
+    헤더/푸터를 '대표 문구' 기반으로 제거.
+    기존 _remove_techpresso_header_footer_safely()가 길이 제한 때문에 놓치는 케이스 보완.
+    """
+    header_markers = [
+        "join free",
+        "upgrade",
+        "together with",
+        "hi there, this is your daily",
+        "in today's techpresso",
+    ]
+    footer_markers = [
+        "not subscribed to",
+        "subscribe for free",
+        "advertise",
+        "feedback",
+        "read online",
+    ]
+
+    def _hit(text, markers):
+        t = (text or "").lower()
+        return any(m in t for m in markers)
+
+    removed_header = 0
+    removed_footer = 0
+
+    for node in list(soup.find_all(string=True)):
+        txt = re.sub(r"\s+", " ", str(node)).strip()
+        if not txt:
+            continue
+
+        is_header = _hit(txt, header_markers)
+        is_footer = _hit(txt, footer_markers)
+        if not (is_header or is_footer):
+            continue
+
+        candidates = []
+        for name in ("tr","td","table","div","section"):
+            anc = node.find_parent(name)
+            if not anc:
+                continue
+            a_txt = anc.get_text(" ", strip=True)
+            if not a_txt:
+                continue
+            l = len(a_txt)
+            if 80 < l < 30000:
+                candidates.append((l, anc))
+
+        if not candidates:
+            continue
+
+        candidates.sort(key=lambda x: x[0])
+        candidates[0][1].decompose()
+        if is_header:
+            removed_header += 1
+        if is_footer:
+            removed_footer += 1
+
+    if removed_header:
+        print("Header blocks removed (marker-based):", removed_header)
+    if removed_footer:
+        print("Footer blocks removed (marker-based):", removed_footer)
+
+
 def _remove_blocks_containing_keywords_safely(soup: BeautifulSoup, keywords):
     """
     keywords가 포함된 블록을 삭제하되,
@@ -254,53 +382,6 @@ def _remove_blocks_containing_keywords_safely(soup: BeautifulSoup, keywords):
         if parent and parent.name in ("p", "h1", "h2", "h3", "h4", "td"):
             parent.decompose()
 
-def _remove_partner_sections_only(soup: BeautifulSoup):
-    """
-    'FROM OUR PARTNER' 섹션만 확실하게 통째 제거.
-    - table 우선 제거
-    - 단, 메일 전체 wrapper일 가능성 방어
-    """
-    removed = 0
-
-    while True:
-        hit = None
-        for node in list(soup.find_all(string=True)):
-            txt = str(node).strip()
-            if txt.upper() == "FROM OUR PARTNER":
-                hit = node
-                break
-
-        if hit is None:
-            break
-
-        # 1) table 최우선 제거
-        table = hit.find_parent("table")
-        if table:
-            tlen = len(table.get_text(" ", strip=True))
-            if 500 < tlen < 25000:
-                table.decompose()
-                removed += 1
-                continue
-
-        # 2) fallback: tr / td / div / section 중 가장 작은 것
-        candidates = []
-        for name in ("tr", "td", "div", "section"):
-            anc = hit.find_parent(name)
-            if not anc:
-                continue
-            txt = anc.get_text(" ", strip=True)
-            if 300 < len(txt) < 25000:
-                candidates.append((len(txt), anc))
-
-        if candidates:
-            candidates.sort(key=lambda x: x[0])
-            candidates[0][1].decompose()
-            removed += 1
-        else:
-            break
-
-    print("Partner blocks removed:", removed)
-
 
 # ----------------------
 # URL 표시 제거 + 링크 유지 번역
@@ -316,8 +397,12 @@ def remove_visible_urls(soup: BeautifulSoup):
     for node in list(soup.find_all(string=True)):
         if not isinstance(node, NavigableString):
             continue
-        parent = node.parent.name if node.parent else ""
-        if parent in ("script", "style"):
+        parent_name = node.parent.name if node.parent else ""
+        if parent_name in ("script", "style"):
+            continue
+
+        # ✅ bold/strong 텍스트(도구명/고유명사)는 번역 제외
+        if parent_name in ("strong", "b"):
             continue
 
         txt = str(node)
@@ -343,16 +428,13 @@ def translate_text_nodes_inplace(soup: BeautifulSoup):
         if not isinstance(node, NavigableString):
             continue
 
-        parent_tag = node.parent
-        parent_name = parent_tag.name if parent_tag else ""
-        
+        parent_name = node.parent.name if node.parent else ""
         if parent_name in ("script", "style"):
             continue
-        
-        # ✅ bold / strong 은 번역 제외 (Trending tools 이름 보호)
+
+        # ✅ bold/strong 텍스트(도구명/고유명사)는 번역 제외
         if parent_name in ("strong", "b"):
             continue
-
 
         text = str(node)
         if not text.strip():
@@ -385,8 +467,9 @@ def translate_html_preserve_layout(html: str, date_str: str) -> str:
 
     # 0) 헤더/푸터 제거
     _remove_techpresso_header_footer_safely(soup)
+    _remove_header_footer_by_markers(soup)
 
-    # 1) 파트너 섹션 삭제
+    # 1) 파트너 섹션 삭제 (FROM OUR PARTNER만 강력 제거)
     _remove_partner_sections_only(soup)
 
     # 2) AI Academy 섹션 삭제
