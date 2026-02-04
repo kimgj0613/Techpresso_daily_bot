@@ -4,3 +4,4 @@ reportlab==4.2.2
 python-dateutil==2.9.0.post0
 beautifulsoup4
 weasyprint
+deepl==1.18.0
