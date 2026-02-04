@@ -65,20 +65,21 @@ def translate_html_preserve_layout(html):
         ad.decompose()
 
     # ----------------------
-    # 텍스트 노드만 번역
+    # 문단/리스트 단위로 번역 (정답)
     # ----------------------
-    for node in soup.find_all(string=True):
-        parent = node.parent.name
-        if parent in ["script", "style", "head"]:
+    for tag in soup.find_all(["p", "li", "h1", "h2", "h3"]):
+        text = tag.get_text(strip=True)
+    
+        # 너무 짧은 문장은 스킵
+        if len(text) < 5:
             continue
-
-        text = node.strip()
-        if len(text) < 3:
-            continue
-
+    
         translated = translate_text(text)
-        node.replace_with(translated)
-
+    
+        # 태그 안 내용을 통째로 교체
+        tag.clear()
+        tag.append(translated)
+    
     return str(soup)
 
 
