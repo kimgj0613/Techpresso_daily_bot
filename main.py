@@ -50,7 +50,8 @@ def translate_text(text, retries=3):
             if r.status_code == 200:
                 return r.json().get("translatedText", text)
         except Exception:
-            time.sleep(2)
+            print("ERROR:", e)
+
 
     return text  # 실패 시 원문 유지
 
