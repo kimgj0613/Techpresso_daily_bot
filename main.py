@@ -4,8 +4,7 @@ import time
 import feedparser
 from datetime import datetime, timezone
 from dateutil import tz
-from bs4 import BeautifulSoup
-from bs4 import NavigableString
+from bs4 import BeautifulSoup, NavigableString
 from weasyprint import HTML
 import smtplib, ssl
 from email.message import EmailMessage
@@ -158,7 +157,7 @@ def translate_text(text: str, retries: int = 3) -> str:
 
 
 # ======================
-# HTML 제거/브랜딩/번역
+# HTML 정리/브랜딩/번역
 # ======================
 REMOVE_KEYWORDS_HEADER_FOOTER = [
     "Join Free",
@@ -225,7 +224,7 @@ def _remove_blocks_containing_keywords_safely(soup: BeautifulSoup, keywords):
     """
     keywords가 포함된 블록을 삭제하되,
     table/tr/td를 바로 지우면 다른 섹션까지 같이 날아갈 수 있어서
-    기본은 div/section을 우선 삭제하고, table은 '작은' 경우에만 삭제.
+    기본은 div/section을 우선 삭제하고, table은 '짧은' 경우에만 삭제.
     """
     for node in list(soup.find_all(string=True)):
         if not isinstance(node, str):
@@ -241,7 +240,7 @@ def _remove_blocks_containing_keywords_safely(soup: BeautifulSoup, keywords):
                 container.decompose()
                 continue
 
-        # 2) 그래도 없으면 table(짧을 때만)
+        # 2) table은 짧을 때만
         table = node.find_parent("table")
         if table:
             txt = table.get_text(" ", strip=True)
@@ -249,10 +248,31 @@ def _remove_blocks_containing_keywords_safely(soup: BeautifulSoup, keywords):
                 table.decompose()
                 continue
 
-        # 3) 마지막 fallback: 해당 텍스트 노드 주변만 제거(과감한 삭제 방지)
+        # 3) 마지막 fallback: 해당 텍스트 노드 주변만 제거
         parent = node.parent
         if parent and parent.name in ("p", "h1", "h2", "h3", "h4", "td"):
             parent.decompose()
+
+
+def _remove_partner_tables_by_heading(soup: BeautifulSoup):
+    """
+    ✅ 파트너 섹션은 전부 삭제해야 하므로,
+    'FROM OUR PARTNER'가 포함된 위치에서 가장 가까운 table을 크기 제한 없이 제거.
+    (Beehiiv 파트너 광고는 대부분 table 블록으로 구성)
+    """
+    for node in list(soup.find_all(string=True)):
+        if not isinstance(node, str):
+            continue
+        if "FROM OUR PARTNER" not in node:
+            continue
+
+        table = node.find_parent("table")
+        if table:
+            table.decompose()
+        else:
+            container = node.find_parent(["div", "section"])
+            if container:
+                container.decompose()
 
 
 # ----------------------
@@ -277,7 +297,6 @@ def remove_visible_urls(soup: BeautifulSoup):
         if not txt.strip():
             continue
 
-        # URL이 텍스트로 노출된 경우만 제거
         if URL_RE.search(txt):
             cleaned = URL_RE.sub("", txt)
             cleaned = re.sub(r"\(\s*\)", "", cleaned)      # 빈 괄호 제거
@@ -332,33 +351,37 @@ def translate_html_preserve_layout(html: str, date_str: str) -> str:
     # 0) 헤더/푸터 제거
     _remove_techpresso_header_footer_safely(soup)
 
-    # 1) 파트너 섹션 삭제
+    # 1) ✅ 파트너 섹션 전부 삭제(가장 확실한 방식: table 통째로 제거)
+    _remove_partner_tables_by_heading(soup)
+
+    # 2) 파트너 섹션 삭제(백업: 혹시 table이 아닌 형태가 섞여 있으면)
     _remove_blocks_containing_keywords_safely(soup, PARTNER_KEYWORDS)
 
-    # 2) AI Academy 섹션 삭제
+    # 3) AI Academy 섹션 삭제
     _remove_blocks_containing_keywords_safely(soup, REMOVE_SECTION_KEYWORDS)
 
-    # 3) 광고 제거
+    # 4) 광고 제거(있으면)
     for ad in soup.select("[data-testid='ad'], .sponsor, .advertisement"):
         ad.decompose()
 
-    # 4) 브랜딩 치환 (Techpresso -> OneSip)
+    # 5) 브랜딩 치환 (Techpresso -> OneSip)
     _replace_brand_everywhere(soup, BRAND_FROM, BRAND_TO)
 
-    # ✅ 5) URL을 PDF에 표시하지 않도록 텍스트 URL 제거
+    # ✅ 6) URL을 PDF에 표시하지 않도록 텍스트 URL 제거
     remove_visible_urls(soup)
 
-    # ✅ 6) 링크 포함 '텍스트 노드만' 번역 (태그 구조 유지 → 링크 유지)
+    # ✅ 7) 링크 포함 '텍스트 노드만' 번역 (태그 구조 유지 → 링크 유지)
     translate_text_nodes_inplace(soup)
 
     out_html = str(soup)
 
-    # fallback: 본문이 너무 짧으면 제거 없이 다시 번역(단, 파트너/아카데미 삭제는 유지)
+    # fallback: 본문이 너무 짧으면 헤더/푸터 제거만 취소하고 다시 (파트너/아카데미 삭제는 유지)
     text_len = len(BeautifulSoup(out_html, "html.parser").get_text(" ", strip=True))
     if text_len < 200:
         print("WARNING: HTML too small after cleanup. Falling back without header/footer removal.")
         soup2 = BeautifulSoup(html, "html.parser")
 
+        _remove_partner_tables_by_heading(soup2)
         _remove_blocks_containing_keywords_safely(soup2, PARTNER_KEYWORDS)
         _remove_blocks_containing_keywords_safely(soup2, REMOVE_SECTION_KEYWORDS)
 
