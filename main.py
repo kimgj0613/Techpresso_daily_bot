@@ -47,13 +47,17 @@ def translate_text(text, retries=3):
     for i in range(retries):
         try:
             r = requests.post(TRANSLATE_URL, json=payload, timeout=60)
+            print("TRANSLATE INPUT:", text[:60])
+            print("STATUS:", r.status_code)
+            print("RAW RESPONSE:", r.text[:200])
+
             if r.status_code == 200:
                 return r.json().get("translatedText", text)
-        except Exception:
+        except Exception as e:
             print("ERROR:", e)
+            time.sleep(2)
 
-
-    return text  # 실패 시 원문 유지
+    return text
 
 
 def translate_html_preserve_layout(html):
