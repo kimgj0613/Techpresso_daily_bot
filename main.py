@@ -5,6 +5,7 @@ import feedparser
 from datetime import datetime, timezone
 from dateutil import tz
 from bs4 import BeautifulSoup
+from bs4 import NavigableString
 from weasyprint import HTML
 import smtplib, ssl
 from email.message import EmailMessage
@@ -129,7 +130,6 @@ def translate_text(text: str, retries: int = 3) -> str:
     if translator is None:
         raise ValueError("DEEPL_API_KEY가 설정되지 않았습니다.")
 
-    # ✅ OneSip 보호
     protected, mapping = protect_terms(text)
 
     chunks = _split_by_paragraph(protected, max_chars=4500)
@@ -154,7 +154,6 @@ def translate_text(text: str, retries: int = 3) -> str:
         out_parts.append(translated if translated is not None else ch)
 
     joined = "\n\n".join(out_parts)
-    # ✅ placeholder 원복
     return restore_terms(joined, mapping)
 
 
@@ -173,14 +172,12 @@ REMOVE_KEYWORDS_HEADER_FOOTER = [
     "Read Online",
 ]
 
-# (3) 삭제하고 싶은 섹션: Want to master...
 REMOVE_SECTION_KEYWORDS = [
     "Want to master the AI tools we cover every day?",
     "매일 다루는 AI 도구를 마스터하고 싶으신가요?",
-    "AI 아카데미",  # 혹시 카피가 바뀌어도 잡히도록
+    "AI 아카데미",
 ]
 
-# (4) 파트너 섹션 전체 삭제
 PARTNER_KEYWORDS = [
     "FROM OUR PARTNER",
 ]
@@ -191,47 +188,22 @@ def _text_has_any(text: str, keywords):
     return any(k.lower() in t for k in keywords)
 
 
-def _remove_blocks_containing_keywords(soup: BeautifulSoup, keywords, strict=False):
-    """
-    keywords를 포함하는 블록(컨테이너)을 통째로 제거.
-    - strict=False: 과하게 큰 부모를 제거하지 않도록 안전장치 포함
-    """
-    # 키워드가 포함된 "문자열 노드"를 찾고, 그 부모 컨테이너를 위로 타고 올라가 제거
-    for node in list(soup.find_all(string=True)):
-        if not isinstance(node, str):
-            continue
-        if not _text_has_any(node, keywords):
-            continue
-
-        # 우선 table 기반이면 table이 가장 안전 (뉴스레터 레이아웃이 table인 경우가 많음)
-        container = node.find_parent(["table", "section", "div", "tr", "td"])
-        if not container:
-            continue
-
-        # 너무 큰 걸 날리면 본문까지 같이 날아갈 수 있으니 안전장치
-        text = container.get_text(" ", strip=True)
-        if not text:
-            continue
-
-        if not strict:
-            # 파트너/아카데미 블록은 보통 짧음. 9000 넘어가면 본문 포함 가능성 ↑
-            if len(text) > 9000:
-                # 한 단계 더 작은 쪽을 시도
-                smaller = node.find_parent(["tr", "td", "div", "section"])
-                if smaller and len(smaller.get_text(" ", strip=True)) < len(text):
-                    container = smaller
-                else:
-                    continue
-
-        container.decompose()
-
-
 def _match_keyword_count(text: str, keywords) -> int:
     t = (text or "").lower()
     return sum(1 for k in keywords if k.lower() in t)
 
 
+def _replace_brand_everywhere(soup: BeautifulSoup, old: str, new: str):
+    for t in soup.find_all(string=True):
+        if old in t:
+            t.replace_with(t.replace(old, new))
+
+
 def _remove_techpresso_header_footer_safely(soup: BeautifulSoup):
+    """
+    너무 큰 컨테이너를 날려서 본문이 사라지는 걸 줄이기 위해
+    '짧은 블록' 위주로만 제거.
+    """
     candidates = soup.find_all(["header", "footer", "div", "section", "table", "tr", "td"])
     for tag in candidates:
         text = tag.get_text(" ", strip=True)
@@ -249,69 +221,122 @@ def _remove_techpresso_header_footer_safely(soup: BeautifulSoup):
             tag.decompose()
 
 
-def _replace_brand_everywhere(soup: BeautifulSoup, old: str, new: str):
-    for t in soup.find_all(string=True):
-        if old in t:
-            t.replace_with(t.replace(old, new))
-
-
-def _append_link_hrefs_if_any(tag):
-    links = []
-    for a in tag.find_all("a", href=True):
-        href = (a.get("href") or "").strip()
-        if href and href not in links:
-            links.append(href)
-    return links
-
-
-def _is_leaf_text_container(tag) -> bool:
+def _remove_blocks_containing_keywords_safely(soup: BeautifulSoup, keywords):
     """
-    Trending tools가 p/li가 아니라 div/span/td에 박혀있는 경우가 있어서
-    'leaf 컨테이너'도 번역 대상으로 포함.
+    keywords가 포함된 블록을 삭제하되,
+    table/tr/td를 바로 지우면 다른 섹션까지 같이 날아갈 수 있어서
+    기본은 div/section을 우선 삭제하고, table은 '작은' 경우에만 삭제.
     """
-    if tag.name not in ["div", "span", "td"]:
-        return False
-    # 자식에 구조 태그가 있으면 leaf가 아니라고 보고 제외
-    if tag.find(["p", "li", "ul", "ol", "table", "img", "h1", "h2", "h3", "h4"]):
-        return False
-    # br 정도는 허용
-    non_br_children = [c for c in tag.find_all(True, recursive=False) if c.name != "br"]
-    return len(non_br_children) == 0
-
-
-def _translate_blocks_in_soup(soup: BeautifulSoup) -> BeautifulSoup:
-    # 기존 + h4 + leaf div/span/td까지 확대 (Trending tools 대응)
-    for tag in soup.find_all(["p", "li", "h1", "h2", "h3", "h4", "div", "span", "td"]):
-        if tag.name in ["div", "span", "td"] and not _is_leaf_text_container(tag):
+    for node in list(soup.find_all(string=True)):
+        if not isinstance(node, str):
+            continue
+        if not _text_has_any(node, keywords):
             continue
 
-        text = tag.get_text(" ", strip=True)
-        if len(text) < 5:
+        # 1) div/section 우선 (가장 안전)
+        container = node.find_parent(["div", "section"])
+        if container:
+            txt = container.get_text(" ", strip=True)
+            if txt and len(txt) <= 6000:
+                container.decompose()
+                continue
+
+        # 2) 그래도 없으면 table(짧을 때만)
+        table = node.find_parent("table")
+        if table:
+            txt = table.get_text(" ", strip=True)
+            if txt and len(txt) <= 3500:
+                table.decompose()
+                continue
+
+        # 3) 마지막 fallback: 해당 텍스트 노드 주변만 제거(과감한 삭제 방지)
+        parent = node.parent
+        if parent and parent.name in ("p", "h1", "h2", "h3", "h4", "td"):
+            parent.decompose()
+
+
+# ----------------------
+# URL 표시 제거 + 링크 유지 번역
+# ----------------------
+URL_RE = re.compile(r"(https?://\S+|www\.\S+)", re.IGNORECASE)
+
+
+def remove_visible_urls(soup: BeautifulSoup):
+    """
+    '텍스트로 노출된 URL'만 제거해서 PDF에 URL이 보이지 않게.
+    <a href="...">는 건드리지 않아서 링크는 유지됨.
+    """
+    for node in list(soup.find_all(string=True)):
+        if not isinstance(node, NavigableString):
+            continue
+        parent = node.parent.name if node.parent else ""
+        if parent in ("script", "style"):
             continue
 
-        hrefs = _append_link_hrefs_if_any(tag)
+        txt = str(node)
+        if not txt.strip():
+            continue
+
+        # URL이 텍스트로 노출된 경우만 제거
+        if URL_RE.search(txt):
+            cleaned = URL_RE.sub("", txt)
+            cleaned = re.sub(r"\(\s*\)", "", cleaned)      # 빈 괄호 제거
+            cleaned = re.sub(r"\s{2,}", " ", cleaned).strip()
+            node.replace_with(cleaned)
+
+
+def translate_text_nodes_inplace(soup: BeautifulSoup):
+    """
+    HTML 태그 구조는 그대로 유지하고, 텍스트 노드만 번역.
+    => <a href> 링크 유지 + URL은 번역/표시하지 않음
+    """
+    translated_nodes = 0
+
+    for node in list(soup.find_all(string=True)):
+        if not isinstance(node, NavigableString):
+            continue
+
+        parent = node.parent.name if node.parent else ""
+        if parent in ("script", "style"):
+            continue
+
+        text = str(node)
+        if not text.strip():
+            continue
+
+        # URL이 텍스트로 들어있다면(혹시 남았으면) 번역 전에 제거
+        if URL_RE.search(text):
+            text = URL_RE.sub("", text)
+
+        # 영어 알파벳이 거의 없으면 스킵(숫자/기호/이미 한글 위주)
+        if len(re.findall(r"[A-Za-z]", text)) < 2:
+            continue
+
+        # 너무 긴 노드는 위험/비용 큼 → 스킵
+        if len(text) > 2000:
+            continue
+
         translated = translate_text(text)
+        if translated is None:
+            continue
 
-        if hrefs:
-            translated += "\n" + "\n".join([f"({u})" for u in hrefs])
+        node.replace_with(translated)
+        translated_nodes += 1
 
-        tag.clear()
-        tag.append(translated)
-
-    return soup
+    print("Translated text nodes:", translated_nodes)
 
 
 def translate_html_preserve_layout(html: str, date_str: str) -> str:
     soup = BeautifulSoup(html, "html.parser")
 
-    # 0) 헤더/푸터 제거(기존)
+    # 0) 헤더/푸터 제거
     _remove_techpresso_header_footer_safely(soup)
 
-    # 1) (4) FROM OUR PARTNER 섹션 전체 삭제 (두 번 나오는 것 모두)  ✅
-    _remove_blocks_containing_keywords(soup, PARTNER_KEYWORDS, strict=False)
+    # 1) 파트너 섹션 삭제
+    _remove_blocks_containing_keywords_safely(soup, PARTNER_KEYWORDS)
 
-    # 2) (3) Want to master... / AI Academy 섹션 삭제 ✅
-    _remove_blocks_containing_keywords(soup, REMOVE_SECTION_KEYWORDS, strict=False)
+    # 2) AI Academy 섹션 삭제
+    _remove_blocks_containing_keywords_safely(soup, REMOVE_SECTION_KEYWORDS)
 
     # 3) 광고 제거
     for ad in soup.select("[data-testid='ad'], .sponsor, .advertisement"):
@@ -320,25 +345,30 @@ def translate_html_preserve_layout(html: str, date_str: str) -> str:
     # 4) 브랜딩 치환 (Techpresso -> OneSip)
     _replace_brand_everywhere(soup, BRAND_FROM, BRAND_TO)
 
-    # 5) 번역 (Trending tools 포함되도록 확장)
-    soup = _translate_blocks_in_soup(soup)
+    # ✅ 5) URL을 PDF에 표시하지 않도록 텍스트 URL 제거
+    remove_visible_urls(soup)
+
+    # ✅ 6) 링크 포함 '텍스트 노드만' 번역 (태그 구조 유지 → 링크 유지)
+    translate_text_nodes_inplace(soup)
+
     out_html = str(soup)
 
-    # fallback: 본문이 너무 짧으면 제거 없이 다시 번역
+    # fallback: 본문이 너무 짧으면 제거 없이 다시 번역(단, 파트너/아카데미 삭제는 유지)
     text_len = len(BeautifulSoup(out_html, "html.parser").get_text(" ", strip=True))
     if text_len < 200:
         print("WARNING: HTML too small after cleanup. Falling back without header/footer removal.")
         soup2 = BeautifulSoup(html, "html.parser")
 
-        # 파트너/아카데미 삭제는 유지
-        _remove_blocks_containing_keywords(soup2, PARTNER_KEYWORDS, strict=False)
-        _remove_blocks_containing_keywords(soup2, REMOVE_SECTION_KEYWORDS, strict=False)
+        _remove_blocks_containing_keywords_safely(soup2, PARTNER_KEYWORDS)
+        _remove_blocks_containing_keywords_safely(soup2, REMOVE_SECTION_KEYWORDS)
 
         for ad in soup2.select("[data-testid='ad'], .sponsor, .advertisement"):
             ad.decompose()
 
         _replace_brand_everywhere(soup2, BRAND_FROM, BRAND_TO)
-        soup2 = _translate_blocks_in_soup(soup2)
+        remove_visible_urls(soup2)
+        translate_text_nodes_inplace(soup2)
+
         out_html = str(soup2)
 
     if DEBUG_DUMP_HTML:
