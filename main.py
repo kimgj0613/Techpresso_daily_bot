@@ -15,11 +15,18 @@ import deepl
 # 기본 설정
 # ======================
 RSS_URL = os.getenv("RSS_URL", "https://rss.beehiiv.com/feeds/ez2zQOMePQ.xml")
+
 DEEPL_API_KEY = os.getenv("DEEPL_API_KEY")
 DEEPL_SERVER_URL = os.getenv("DEEPL_SERVER_URL", "https://api-free.deepl.com")  # Free 기본
 
 SMTP_HOST = os.getenv("SMTP_HOST", "smtp.gmail.com")
 SMTP_PORT = int(os.getenv("SMTP_PORT", "465"))
+
+MAIL_SUBJECT_PREFIX = "☕ OneSip | Today’s Tech in One Sip"
+MAIL_BODY_LINE = "OneSip – Your daily tech clarity"
+
+BRAND_FROM = "Techpresso"
+BRAND_TO = "OneSip"
 
 KST = tz.gettz("Asia/Seoul")
 
@@ -40,19 +47,18 @@ def is_sunday_kst():
 
 
 def safe_print_deepl_usage():
-    """DeepL 사용량 로그 (네트워크 이슈로 실패해도 전체 실행은 계속)"""
+    """DeepL 사용량 로그 (실패해도 전체 실행은 계속)"""
     if not translator:
         return
     try:
         usage = translator.get_usage()
-        # usage.character.count / usage.character.limit
         print(f"DeepL usage: {usage.character.count}/{usage.character.limit}")
     except Exception as e:
         print("DeepL usage check failed:", e)
 
 
 # ======================
-# DeepL 번역 (긴 텍스트 안전 처리)
+# DeepL 번역 (긴 텍스트 안정 처리)
 # ======================
 def _split_by_paragraph(text: str, max_chars: int = 4500):
     """
@@ -92,8 +98,8 @@ def _split_by_paragraph(text: str, max_chars: int = 4500):
 
 def translate_text(text: str, retries: int = 3) -> str:
     """
-    - OpenAI/LibreTranslate 없이 DeepL만 사용
-    - source_lang을 고정하지 않고 자동 감지 (혼합 텍스트/고유명사에 안정적)
+    - DeepL만 사용
+    - source_lang 고정하지 않고 자동 감지(혼합 텍스트 안정)
     - 긴 텍스트는 문단 chunk로 나눠 번역
     """
     if not text or not text.strip():
@@ -128,13 +134,61 @@ def translate_text(text: str, retries: int = 3) -> str:
 
 
 # ======================
-# HTML 번역 (레이아웃 유지, 링크 정보 최소 보존)
+# HTML 정리/브랜딩/번역
 # ======================
+def _remove_techpresso_header_footer(soup: BeautifulSoup):
+    """
+    Beehiiv 공통 헤더/푸터(Join Free/Upgrade/Subscribe 등) 제거.
+    클래스가 자주 바뀌므로 텍스트 패턴 기반으로 제거.
+    """
+
+    # 제거 판단에 쓰는 키워드(대체로 헤더/푸터에만 존재)
+    keywords = [
+        "Join Free",
+        "Upgrade",
+        "Together with",
+        "this is your daily",
+        "Not subscribed to",
+        "Subscribe for free",
+        "Advertise",
+        "Feedback",
+        "Read Online",
+    ]
+    kw_lower = [k.lower() for k in keywords]
+
+    def match_score(text: str) -> int:
+        t = (text or "").lower()
+        score = 0
+        for k in kw_lower:
+            if k in t:
+                score += 1
+        return score
+
+    # 1) header/footer 태그는 우선 제거 시도
+    for tag in soup.find_all(["header", "footer"]):
+        text = tag.get_text(" ", strip=True)
+        if match_score(text) >= 1:
+            tag.decompose()
+
+    # 2) div/section 중에서도 헤더/푸터 블록이 포함된 컨테이너 제거
+    #    오탐을 줄이기 위해 '2개 이상' 키워드 매칭일 때 제거
+    for tag in soup.find_all(["div", "section"]):
+        text = tag.get_text(" ", strip=True)
+        if match_score(text) >= 2:
+            tag.decompose()
+
+
+def _replace_brand_everywhere(soup: BeautifulSoup, old: str, new: str):
+    # 텍스트 노드 전체 치환
+    for t in soup.find_all(string=True):
+        if old in t:
+            t.replace_with(t.replace(old, new))
+
+
 def _append_link_hrefs_if_any(tag):
     """
-    tag 내부에 a[href]가 있으면, 링크 텍스트만 남기게 되면서 URL이 사라지므로
-    괄호로 URL을 덧붙여 정보 손실 최소화.
-    예) "Read more" + (https://...)
+    번역 과정에서 a 태그 구조가 사라질 수 있으므로 URL을 괄호로 덧붙여
+    링크 정보 손실을 최소화.
     """
     links = []
     for a in tag.find_all("a", href=True):
@@ -147,29 +201,32 @@ def _append_link_hrefs_if_any(tag):
 def translate_html_preserve_layout(html: str) -> str:
     soup = BeautifulSoup(html, "html.parser")
 
-    # ✅ 광고/스폰서/광고 영역 제거(있으면)
+    # (1) Beehiiv 공통 헤더/푸터 제거
+    _remove_techpresso_header_footer(soup)
+
+    # (2) 광고/스폰서/광고 영역 제거(있으면)
     for ad in soup.select("[data-testid='ad'], .sponsor, .advertisement"):
         ad.decompose()
 
-    # 문단/리스트/헤더만 번역
-    for tag in soup.find_all(["p", "li", "h1", "h2", "h3"]):
-        # 공백 보존(인라인 태그 섞여도 단어가 붙지 않게)
-        text = tag.get_text(" ", strip=True)
+    # (3) 브랜딩 치환 (Techpresso -> OneSip)
+    _replace_brand_everywhere(soup, BRAND_FROM, BRAND_TO)
 
-        # 너무 짧은 문장은 스킵
+    # (4) 문단/리스트/헤더만 번역
+    for tag in soup.find_all(["p", "li", "h1", "h2", "h3"]):
+        text = tag.get_text(" ", strip=True)  # 공백 유지
+
         if len(text) < 5:
             continue
 
-        # 링크 URL 보존용
+        # 링크 URL 보존
         hrefs = _append_link_hrefs_if_any(tag)
 
         translated = translate_text(text)
 
-        # 링크 URL 덧붙이기(원하면 끌 수 있음)
+        # 링크 URL 덧붙이기
         if hrefs:
             translated += "\n" + "\n".join([f"({u})" for u in hrefs])
 
-        # 태그 안 내용을 통째로 교체
         tag.clear()
         tag.append(translated)
 
@@ -200,7 +257,7 @@ def fetch_today_html():
 # PDF 생성
 # ======================
 def html_to_pdf(html: str, date_str: str):
-    filename = f"Gmail - Techpresso_{date_str}.pdf"
+    filename = f"Gmail - OneSip_{date_str}.pdf"
     HTML(string=html).write_pdf(filename)
     return filename
 
@@ -224,10 +281,10 @@ def send_email(pdf_path: str, date_str: str):
         raise ValueError(f"이메일 설정 환경변수가 비었습니다: {', '.join(missing)}")
 
     msg = EmailMessage()
-    msg["Subject"] = f"Techpresso 한국어 번역 ({date_str})"
+    msg["Subject"] = f"{MAIL_SUBJECT_PREFIX} ({date_str})"
     msg["From"] = mail_from
     msg["To"] = mail_to
-    msg.set_content("오늘의 Techpresso 한글 번역본을 첨부합니다.")
+    msg.set_content(f"{MAIL_BODY_LINE}\n\n오늘의 한글 번역본을 첨부합니다.")
 
     with open(pdf_path, "rb") as f:
         msg.add_attachment(
@@ -251,14 +308,13 @@ def main():
         print("Sunday – skipped")
         return
 
-    # ✅ DeepL 사용량 로그(실패해도 계속 진행)
     safe_print_deepl_usage()
 
     date_str = now_kst().strftime("%Y-%m-%d")
 
     raw_html = fetch_today_html()
     if not raw_html:
-        print("No Techpresso issue found today.")
+        print("No issue found today.")
         return
 
     translated_html = translate_html_preserve_layout(raw_html)
