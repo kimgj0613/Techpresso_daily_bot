@@ -8,16 +8,21 @@ from bs4 import BeautifulSoup
 from weasyprint import HTML
 import smtplib, ssl
 from email.message import EmailMessage
+import deepl
 
 
 # ======================
 # 기본 설정
 # ======================
 RSS_URL = os.getenv("RSS_URL", "https://rss.beehiiv.com/feeds/ez2zQOMePQ.xml")
-TRANSLATE_URL = os.getenv("TRANSLATE_URL", "https://libretranslate.com/translate")
+DEEPL_API_KEY = os.getenv("DEEPL_API_KEY")
+DEEPL_SERVER_URL = os.getenv("DEEPL_SERVER_URL", "https://api-free.deepl.com")  # Free 기본
 
 KST = tz.gettz("Asia/Seoul")
 
+translator = None
+if DEEPL_API_KEY:
+    translator = deepl.Translator(DEEPL_API_KEY, server_url=DEEPL_SERVER_URL)
 
 # ======================
 # 유틸
@@ -37,25 +42,24 @@ def translate_text(text, retries=3):
     if not text.strip():
         return text
 
-    payload = {
-        "q": text,
-        "source": "en",
-        "target": "ko",
-        "format": "text"
-    }
+    if translator is None:
+        raise ValueError("DEEPL_API_KEY가 설정되지 않았습니다.")
 
     for i in range(retries):
         try:
-            r = requests.post(TRANSLATE_URL, json=payload, timeout=60)
-            print("TRANSLATE INPUT:", text[:60])
-            print("STATUS:", r.status_code)
-            print("RAW RESPONSE:", r.text[:200])
+            # preserve_formatting=True: 줄바꿈/형식 유지에 도움
+            # source_lang="EN"은 고정 소스면 넣는 게 안정적 (자동감지도 가능)
+            result = translator.translate_text(
+                text,
+                source_lang="EN",
+                target_lang="KO",
+                preserve_formatting=True
+            )
+            return result.text
 
-            if r.status_code == 200:
-                return r.json().get("translatedText", text)
         except Exception as e:
-            print("ERROR:", e)
-            time.sleep(2)
+            print("DEEPL ERROR:", e)
+            time.sleep(2 * (i + 1))
 
     return text
 
