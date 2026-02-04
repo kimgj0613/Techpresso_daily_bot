@@ -24,7 +24,15 @@ jobs:
 
       - name: Run script
         env:
+          # RSS
           RSS_URL: "https://rss.beehiiv.com/feeds/ez2zQOMePQ.xml"
+
+          # DeepL (✅ 새로 추가)
+          DEEPL_API_KEY: ${{ secrets.DEEPL_API_KEY }}
+          # Free 플랜이면 api-free, Pro면 api
+          DEEPL_SERVER_URL: "https://api-free.deepl.com"
+
+          # Email
           SMTP_HOST: "smtp.gmail.com"
           SMTP_PORT: "465"
           SMTP_USER: ${{ secrets.SMTP_USER }}
@@ -33,12 +41,3 @@ jobs:
           MAIL_TO: ${{ secrets.MAIL_TO }}
         run: |
           python main.py
-
-env:
-  RSS_URL: ${{ secrets.RSS_URL }}
-  DEEPL_API_KEY: ${{ secrets.DEEPL_API_KEY }}
-  DEEPL_SERVER_URL: https://api-free.deepl.com
-  SMTP_USER: ${{ secrets.SMTP_USER }}
-  SMTP_PASS: ${{ secrets.SMTP_PASS }}
-  MAIL_FROM: ${{ secrets.MAIL_FROM }}
-  MAIL_TO: ${{ secrets.MAIL_TO }}
