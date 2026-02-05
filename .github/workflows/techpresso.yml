@@ -71,5 +71,5 @@ jobs:
         with:
           name: onesip-output
           path: |
-            Gmail - OneSip_*.pdf
+            HCS - OneSip_*.pdf
             debug_onesip_*.html
