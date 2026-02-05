@@ -229,40 +229,97 @@ def _remove_techpresso_header_footer_safely(soup: BeautifulSoup):
             tag.decompose()
 
 
+def _find_ancestor_tag(node, names):
+    """
+    node에서 시작해서 부모로 올라가며 names 중 하나인 태그를 찾는다.
+    bs4의 find_parent()를 안 쓰고, 직접 parent 체인을 타서
+    NavigableString parent 관련 예외를 근본적으로 회피한다.
+    """
+    try:
+        cur = getattr(node, "parent", None)
+    except Exception:
+        return None
+
+    steps = 0
+    while cur is not None and steps < 30:
+        try:
+            if getattr(cur, "name", None) in names:
+                return cur
+            cur = getattr(cur, "parent", None)
+        except Exception:
+            return None
+        steps += 1
+    return None
+
+
 def _remove_blocks_containing_keywords_safely(soup: BeautifulSoup, keywords):
     """
     keywords가 포함된 블록을 삭제하되,
-    table/tr/td를 바로 지우면 다른 섹션까지 같이 날아갈 수 있어서
-    기본은 div/section을 우선 삭제하고, table은 '작은' 경우에만 삭제.
+    div/section 우선 삭제, table은 작은 경우만 삭제.
+    find_parent() 대신 안전한 parent 체인 탐색으로 예외 방지.
     """
-    for node in list(soup.find_all(string=True)):
+    nodes = list(soup.find_all(string=True))  # 스냅샷
+
+    removed = 0
+    for node in nodes:
+        # ✅ NavigableString만 취급 (일반 str은 parent가 없음)
         if not isinstance(node, NavigableString):
             continue
 
-        txt_node = str(node)
-        if not _text_has_any(txt_node, keywords):
+        # node가 이미 분리된 경우가 있어서, 텍스트만 안전하게 읽기
+        try:
+            node_text = str(node)
+        except Exception:
+            continue
+
+        if not _text_has_any(node_text, keywords):
             continue
 
         # 1) div/section 우선
-        container = node.find_parent(["div", "section"]) if hasattr(node, "find_parent") else None
+        container = _find_ancestor_tag(node, {"div", "section"})
         if container:
-            txt = container.get_text(" ", strip=True)
+            try:
+                txt = container.get_text(" ", strip=True)
+            except Exception:
+                txt = ""
             if txt and len(txt) <= 6000:
-                container.decompose()
+                try:
+                    container.decompose()
+                    removed += 1
+                except Exception:
+                    pass
                 continue
 
         # 2) table(짧을 때만)
-        table = node.find_parent("table") if hasattr(node, "find_parent") else None
+        table = _find_ancestor_tag(node, {"table"})
         if table:
-            txt = table.get_text(" ", strip=True)
+            try:
+                txt = table.get_text(" ", strip=True)
+            except Exception:
+                txt = ""
             if txt and len(txt) <= 3500:
-                table.decompose()
+                try:
+                    table.decompose()
+                    removed += 1
+                except Exception:
+                    pass
                 continue
 
-        # 3) fallback: 주변 작은 태그만
-        parent = getattr(node, "parent", None)
+        # 3) fallback: 주변 작은 태그만 제거
+        try:
+            parent = getattr(node, "parent", None)
+        except Exception:
+            parent = None
+
         if parent and getattr(parent, "name", None) in ("p", "h1", "h2", "h3", "h4", "td"):
-            parent.decompose()
+            try:
+                parent.decompose()
+                removed += 1
+            except Exception:
+                pass
+
+    if removed:
+        print("Blocks removed by keywords:", removed)
 
 
 # ----------------------
