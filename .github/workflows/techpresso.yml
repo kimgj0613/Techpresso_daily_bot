@@ -60,6 +60,8 @@ jobs:
 
           # GitHub Variables로 관리 (기본 0)
           DEBUG_DUMP_HTML: ${{ vars.DEBUG_DUMP_HTML }}
+          ISSUE_OFFSET_DAYS: ${{ vars.ISSUE_OFFSET_DAYS }}
+
 
         run: |
           python main.py
