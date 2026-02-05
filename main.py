@@ -538,7 +538,7 @@ def fetch_target_html():
 # PDF 생성
 # ======================
 def html_to_pdf(inner_html: str, date_str: str):
-    filename = f"Gmail - OneSip_{date_str}.pdf"
+    filename = f"HCS - OneSip_{date_str}.pdf"
     final_html = wrap_html_for_pdf(inner_html)
 
     if DEBUG_DUMP_HTML:
