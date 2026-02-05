@@ -225,6 +225,32 @@ def _remove_techpresso_header_footer_safely(soup: BeautifulSoup):
             tag.decompose()
 
 
+# ----------------------
+# ✅ 기사(이슈) 판별/이모지
+# ----------------------
+_EMOJI_RE = re.compile(r"[\U0001F300-\U0001FAFF]")
+
+
+def _table_looks_like_issue(table: Tag) -> bool:
+    """
+    '기사 테이블' 판별 휴리스틱:
+    - 테이블 텍스트에 이모지가 있으면 거의 확정(OneSip 본문 특성)
+    - 아니면 padding-top: 50px 같은 기사 블록 스타일이 있으면 긍정
+    """
+    try:
+        txt = table.get_text(" ", strip=True)
+    except Exception:
+        txt = ""
+    if txt and _EMOJI_RE.search(txt):
+        return True
+
+    style = (table.get("style", "") or "").lower()
+    if "padding-top" in style and "50" in style:
+        return True
+
+    return False
+
+
 def _container_has_issue_content(tag: Tag) -> bool:
     """
     이 컨테이너 안에 '기사 본문'이 들어있으면 True.
@@ -322,34 +348,19 @@ def _remove_blocks_containing_keywords_safely(soup: BeautifulSoup, keywords) -> 
     return removed
 
 
-
 # ----------------------
-# ✅ 첫 번째 FROM OUR PARTNER 블록 제거 (앵커 기반, 타입 A/B 모두 안전)
+# ✅ Partner 블록 제거 (1) Main: 첫 FROM OUR PARTNER를 첫 기사 테이블 직전까지
 # ----------------------
-_EMOJI_RE = re.compile(r"[\U0001F300-\U0001FAFF]")
-
-
-def _find_first_emoji_string(soup: BeautifulSoup):
-    for node in soup.find_all(string=True):
-        if not isinstance(node, NavigableString):
-            continue
-        if _EMOJI_RE.search(str(node)):
-            return node
-    return None
-
-
 def _find_partner_marker_tag(soup: BeautifulSoup) -> Tag | None:
     """
     우선순위:
-    1) h4#main-ad-title (가장 정확)
-    2) id="main-ad-title" 어떤 태그든
-    3) 텍스트 "FROM OUR PARTNER" 포함 노드의 상위 h* / div
+    1) id="main-ad-title"
+    2) 텍스트 "FROM OUR PARTNER" 포함 노드의 상위 h* / div
     """
     tag = soup.find(id="main-ad-title")
     if isinstance(tag, Tag):
         return tag
 
-    # fallback: text search
     for n in soup.find_all(string=True):
         if not isinstance(n, NavigableString):
             continue
@@ -365,32 +376,7 @@ def _find_partner_marker_tag(soup: BeautifulSoup) -> Tag | None:
     return None
 
 
-def _table_looks_like_issue(table: Tag) -> bool:
-    """
-    '기사 테이블' 판별 휴리스틱:
-    - 테이블 텍스트에 이모지가 있으면 거의 확정(OneSip 본문 특성)
-    - 아니면 padding-top: 50px 같은 기사 블록 스타일이 있으면 긍정
-    """
-    try:
-        txt = table.get_text(" ", strip=True)
-    except Exception:
-        txt = ""
-    if txt and _EMOJI_RE.search(txt):
-        return True
-
-    style = (table.get("style", "") or "").lower()
-    if "padding-top" in style and "50" in style:
-        return True
-
-    return False
-
-
 def _find_first_issue_table_after(marker_tag: Tag) -> Tag | None:
-    """
-    marker 이후 등장하는 table들 중,
-    1) 이모지 포함(또는 기사 스타일) table을 우선 반환
-    2) 없으면 marker 이후 첫 table 반환
-    """
     first_table = None
     for t in marker_tag.find_all_next("table"):
         if first_table is None:
@@ -420,7 +406,6 @@ def _remove_first_partner_block_until_first_issue_table(soup: BeautifulSoup) -> 
     common_parent = issue_table
     while common_parent is not None:
         try:
-            # marker가 common_parent 내부에 포함되는지 확인
             if marker in common_parent.descendants:
                 break
         except Exception:
@@ -454,7 +439,6 @@ def _remove_first_partner_block_until_first_issue_table(soup: BeautifulSoup) -> 
         return 0
 
     for node in siblings[i:j]:
-        # 공백 문자열은 extract로 처리
         if isinstance(node, NavigableString):
             if str(node).strip() == "":
                 node.extract()
@@ -463,7 +447,6 @@ def _remove_first_partner_block_until_first_issue_table(soup: BeautifulSoup) -> 
                 removed += 1
             continue
 
-        # Tag는 decompose
         try:
             node.decompose()
         except Exception:
@@ -475,6 +458,133 @@ def _remove_first_partner_block_until_first_issue_table(soup: BeautifulSoup) -> 
 
     return removed
 
+
+# ----------------------
+# ✅ Partner 블록 제거 (2) Spotlight: 두 번째 FROM OUR PARTNER
+# ----------------------
+def _remove_spotlight_partner_block(soup: BeautifulSoup) -> int:
+    """
+    두 번째 FROM OUR PARTNER(spotlight) 광고 블록 제거
+    - id="spotlight-ad-block" / id="spotlight-ad-title" 기반
+    - 가능하면 tr 단위로 제거해서 레이아웃 깨짐 최소화
+    """
+    removed = 0
+
+    block = soup.find(id="spotlight-ad-block")
+    if isinstance(block, Tag):
+        tr = block.find_parent("tr")
+        if isinstance(tr, Tag):
+            tr.decompose()
+        else:
+            block.decompose()
+        removed += 1
+
+    title = soup.find(id="spotlight-ad-title")
+    if isinstance(title, Tag):
+        tr = title.find_parent("tr")
+        if isinstance(tr, Tag):
+            tr.decompose()
+        else:
+            title.decompose()
+        removed += 1
+
+    return removed
+
+
+# ----------------------
+# ✅ Partner 블록 제거 (3) 미래 대비: FROM OUR PARTNER가 3번 이상 생겨도 반복 제거
+# ----------------------
+def _find_next_partner_text_node(soup: BeautifulSoup) -> NavigableString | None:
+    for n in soup.find_all(string=True):
+        if not isinstance(n, NavigableString):
+            continue
+        if "from our partner" in str(n).lower():
+            return n
+    return None
+
+
+def _remove_partner_block_around_text_node(n: NavigableString) -> bool:
+    """
+    'FROM OUR PARTNER' 텍스트 노드 주변의 광고 블록만 제거(기사 영역 보호).
+    제거 우선순위:
+    1) tr (이메일 레이아웃에서 광고는 보통 tr 하나로 끝남)
+    2) table (단, 기사 테이블이면 제거 금지)
+    3) div/section (단, 기사 컨텐츠 섞이면 제거 금지)
+    """
+    if not n or not n.parent:
+        return False
+
+    # 1) tr 우선
+    tr = n.find_parent("tr")
+    if isinstance(tr, Tag):
+        if not _container_has_issue_content(tr):
+            tr.decompose()
+            return True
+
+    # 2) table
+    table = n.find_parent("table")
+    if isinstance(table, Tag):
+        if not _table_looks_like_issue(table) and not _container_has_issue_content(table):
+            table.decompose()
+            return True
+
+    # 3) div/section
+    container = n.find_parent(["div", "section"])
+    if isinstance(container, Tag):
+        if not _container_has_issue_content(container):
+            txt = container.get_text(" ", strip=True)
+            # 너무 큰 건 위험하니 제한
+            if txt and len(txt) <= 3000:
+                container.decompose()
+                return True
+
+    # 4) fallback: h태그/td/p 정도만
+    parent = n.find_parent(["h1", "h2", "h3", "h4", "p", "td"])
+    if isinstance(parent, Tag):
+        try:
+            ptxt = parent.get_text(" ", strip=True)
+            if ptxt and _EMOJI_RE.search(ptxt):
+                return False
+        except Exception:
+            pass
+        parent.decompose()
+        return True
+
+    return False
+
+
+def _remove_partner_blocks_until_limit(soup: BeautifulSoup, max_blocks: int = 5) -> int:
+    """
+    남아있는 FROM OUR PARTNER 블록을 최대 max_blocks개까지 반복 제거.
+    (main/spotlight 제거 후에도 혹시 더 남는 케이스 대비)
+    """
+    removed = 0
+    for _ in range(max_blocks):
+        n = _find_next_partner_text_node(soup)
+        if not n:
+            break
+        if _remove_partner_block_around_text_node(n):
+            removed += 1
+            continue
+        # 제거 실패면 무한 루프 방지: 해당 텍스트만 제거하고 종료
+        try:
+            n.extract()
+        except Exception:
+            pass
+        break
+    return removed
+
+
+# ----------------------
+# 첫 기사 정렬 보정
+# ----------------------
+def _find_first_emoji_string(soup: BeautifulSoup):
+    for node in soup.find_all(string=True):
+        if not isinstance(node, NavigableString):
+            continue
+        if _EMOJI_RE.search(str(node)):
+            return node
+    return None
 
 
 def _ensure_first_issue_left_align(soup: BeautifulSoup):
@@ -573,21 +683,42 @@ def translate_text_nodes_inplace(soup: BeautifulSoup):
     print("Translated text nodes:", translated_nodes)
 
 
+def _remove_partner_everything(soup: BeautifulSoup) -> None:
+    """
+    partner 제거를 한 번에 묶어서 실행 (정상 루트/fallback 루트 공통)
+    순서가 중요:
+    1) main partner(첫 블록) 제거
+    2) spotlight(id 기반) 제거
+    3) 남아있는 FROM OUR PARTNER 반복 제거(미래 대비)
+    """
+    removed_main = _remove_first_partner_block_until_first_issue_table(soup)
+    if removed_main:
+        print("Main partner block removed (until first issue table):", removed_main)
+
+    removed_spot = _remove_spotlight_partner_block(soup)
+    if removed_spot:
+        print("Spotlight partner block removed:", removed_spot)
+
+    removed_rest = _remove_partner_blocks_until_limit(soup, max_blocks=5)
+    if removed_rest:
+        print("Extra partner blocks removed:", removed_rest)
+
+
 def translate_html_preserve_layout(html: str, date_str: str) -> str:
     soup = BeautifulSoup(html, "html.parser")
 
     # 0) 헤더/푸터 제거
     _remove_techpresso_header_footer_safely(soup)
 
-    # ✅ 0.5) 첫 번째 FROM OUR PARTNER 블록(광고)을 "첫 기사 테이블 직전"까지 통째로 삭제
-    removed_partner = _remove_first_partner_block_until_first_issue_table(soup)
-    print("After partner removal text length:",
-      len(BeautifulSoup(str(soup), "html.parser").get_text(" ", strip=True)))
+    # ✅ Partner 전체 제거(1~N)
+    _remove_partner_everything(soup)
 
-    if removed_partner:
-        print("Main partner block removed (until first issue table):", removed_partner)
+    print(
+        "After partner removal text length:",
+        len(BeautifulSoup(str(soup), "html.parser").get_text(" ", strip=True)),
+    )
 
-    # 1) 파트너 섹션 삭제(기타 파트너용, 잔여 처리)
+    # 1) 파트너 키워드 잔여 처리(아주 보수적으로)
     removed_partner2 = _remove_blocks_containing_keywords_safely(soup, PARTNER_KEYWORDS)
     if removed_partner2:
         print("Blocks removed by keywords (partner):", removed_partner2)
@@ -603,21 +734,20 @@ def translate_html_preserve_layout(html: str, date_str: str) -> str:
         len(BeautifulSoup(str(soup), "html.parser").get_text(" ", strip=True)),
     )
 
-    # 3) 광고 제거
+    # 3) 기타 광고 제거(선택자 기반)
     for ad in soup.select("[data-testid='ad'], .sponsor, .advertisement"):
         ad.decompose()
-
 
     # 4) 브랜딩 치환 (Techpresso -> OneSip)
     _replace_brand_everywhere(soup, BRAND_FROM, BRAND_TO)
 
-    # ✅ 5) URL 텍스트 제거(링크는 유지)
+    # 5) URL 텍스트 제거(링크는 유지)
     remove_visible_urls(soup)
 
-    # ✅ 6) 텍스트 노드 번역 (bold/strong은 제외)
+    # 6) 텍스트 노드 번역 (bold/strong은 제외)
     translate_text_nodes_inplace(soup)
 
-    # ✅ 7) 첫 기사 left-align 보정(가운데 밀림 방지)
+    # 7) 첫 기사 left-align 보정(가운데 밀림 방지)
     _ensure_first_issue_left_align(soup)
 
     out_html = str(soup)
@@ -628,7 +758,8 @@ def translate_html_preserve_layout(html: str, date_str: str) -> str:
         print("WARNING: HTML too small after cleanup. Falling back without header/footer removal.")
         soup2 = BeautifulSoup(html, "html.parser")
 
-        _remove_first_partner_block_until_first_issue_table(soup2)
+        # ✅ fallback에서도 partner 제거 동일 적용
+        _remove_partner_everything(soup2)
         _remove_blocks_containing_keywords_safely(soup2, PARTNER_KEYWORDS)
         _remove_blocks_containing_keywords_safely(soup2, REMOVE_SECTION_KEYWORDS)
 
@@ -654,7 +785,6 @@ def translate_html_preserve_layout(html: str, date_str: str) -> str:
     )
 
     return out_html
-
 
 
 # ======================
