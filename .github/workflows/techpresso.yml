@@ -2,7 +2,9 @@ name: OneSip Korean PDF
 
 on:
   schedule:
-    - cron: "30 0 * * 1-6"  # Mon-Sat 00:30 UTC = 09:30 KST
+    # UTC 기준 월~토 18:30
+    # 한국시간(KST) 화~일 03:30 (Techpresso 02:40 이후)
+    - cron: "30 18 * * 1-6"
   workflow_dispatch:
 
 jobs:
