@@ -33,12 +33,11 @@ BRAND_TO = "OneSip"
 # 번역에서 절대 건드리면 안 되는 단어(브랜드/고유명사)
 PROTECT_TERMS = ["OneSip"]
 
-# GitHub Variables(권장) 또는 env로 설정:
-# 0이면 당일, -1이면 하루 전, -2이면 이틀 전...
-ISSUE_OFFSET_DAYS = int(os.getenv("ISSUE_OFFSET_DAYS", "0"))
-
 # 디버그: GitHub Actions에서 HTML/PDF를 아티팩트로 보고 싶으면 1
 DEBUG_DUMP_HTML = os.getenv("DEBUG_DUMP_HTML", "0") == "1"
+
+# 날짜 오프셋(0=당일, -1=어제, -2=그제 ...)
+ISSUE_DATE_OFFSET = int(os.getenv("ISSUE_DATE_OFFSET", "0"))
 
 KST = tz.gettz("Asia/Seoul")
 
@@ -52,6 +51,10 @@ if DEEPL_API_KEY:
 # ======================
 def now_kst():
     return datetime.now(tz=KST)
+
+
+def target_issue_date_kst() -> datetime.date:
+    return (now_kst().date() + timedelta(days=ISSUE_DATE_OFFSET))
 
 
 def safe_print_deepl_usage(prefix="DeepL usage"):
@@ -68,7 +71,10 @@ def safe_print_deepl_usage(prefix="DeepL usage"):
 # 번역 보호(placeholder)
 # ======================
 def protect_terms(text: str):
-    """OneSip 같은 단어가 번역되지 않게 placeholder로 바꾸고, 번역 후 다시 되돌릴 매핑 반환."""
+    """
+    OneSip 같은 단어가 번역되지 않게 placeholder로 바꾸고,
+    번역 후 다시 되돌릴 수 있게 매핑을 반환한다.
+    """
     if not text:
         return text, {}
 
@@ -203,7 +209,10 @@ def _replace_brand_everywhere(soup: BeautifulSoup, old: str, new: str):
 
 
 def _remove_techpresso_header_footer_safely(soup: BeautifulSoup):
-    """너무 큰 컨테이너를 날려서 본문이 사라지는 걸 줄이기 위해 '짧은 블록' 위주로만 제거."""
+    """
+    너무 큰 컨테이너를 날려서 본문이 사라지는 걸 줄이기 위해
+    '짧은 블록' 위주로만 제거.
+    """
     candidates = soup.find_all(["header", "footer", "div", "section", "table", "tr", "td"])
     for tag in candidates:
         text = tag.get_text(" ", strip=True)
@@ -214,9 +223,11 @@ def _remove_techpresso_header_footer_safely(soup: BeautifulSoup):
         if kw == 0:
             continue
 
+        # 너무 큰 블록은 헤더/푸터라도 본문이 섞일 수 있어 방어
         if len(text) > 1600:
             continue
 
+        # div/section/table/tr/td는 키워드 2개 이상일 때만 삭제(과삭제 방지)
         if tag.name in ["div", "section", "table", "tr", "td"]:
             if kw >= 2:
                 tag.decompose()
@@ -228,15 +239,15 @@ def _remove_blocks_containing_keywords_safely(soup: BeautifulSoup, keywords):
     """
     keywords가 포함된 블록을 삭제하되,
     table/tr/td를 바로 지우면 다른 섹션까지 같이 날아갈 수 있어서
-    기본은 div/section 우선, table은 '작은' 경우만.
+    기본은 div/section을 우선 삭제하고, table은 '작은' 경우에만 삭제.
     """
     for node in list(soup.find_all(string=True)):
-        if not isinstance(node, str):
+        if not isinstance(node, NavigableString):
             continue
-        if not _text_has_any(node, keywords):
+        if not _text_has_any(str(node), keywords):
             continue
 
-        # 1) div/section 우선
+        # 1) div/section 우선 (가장 안전)
         container = node.find_parent(["div", "section"])
         if container:
             txt = container.get_text(" ", strip=True)
@@ -244,7 +255,7 @@ def _remove_blocks_containing_keywords_safely(soup: BeautifulSoup, keywords):
                 container.decompose()
                 continue
 
-        # 2) table(짧을 때만)
+        # 2) 그래도 없으면 table(짧을 때만)
         table = node.find_parent("table")
         if table:
             txt = table.get_text(" ", strip=True)
@@ -252,177 +263,50 @@ def _remove_blocks_containing_keywords_safely(soup: BeautifulSoup, keywords):
                 table.decompose()
                 continue
 
-        # 3) fallback
+        # 3) 마지막 fallback: 해당 텍스트 노드 주변만 제거(과감한 삭제 방지)
         parent = node.parent
-        if parent and parent.name in ("p", "h1", "h2", "h3", "h4", "td"):
+        if parent and getattr(parent, "name", None) in ("p", "h1", "h2", "h3", "h4", "td"):
             parent.decompose()
 
 
 # ----------------------
-# 1) 첫 번째 FROM OUR PARTNER(메인 광고 블록) 제거 - 구조 기반(가장 확실)
+# 첫 번째 FROM OUR PARTNER 블록 제거 (HTML 문자열 단계에서, 이모지 섹션 <td>부터 살리기)
 # ----------------------
-def _remove_main_partner_ad_row(soup: BeautifulSoup) -> int:
-    """
-    Beehiiv 메인 광고 블록은 보통 아래 id들을 포함.
-    이 id가 속한 td/tr(row)을 통째로 제거하면 광고 내용 변형(main-ad-copy 유무 등)에 안전.
-    """
-    selectors = [
-        "#main-ad-title",
-        "#main-ad-headline",
-        "#main-ad-image-link",
-        "#main-ad-image",
-        "#main-ad-copy",
-    ]
-
-    removed = 0
-    for sel in selectors:
-        for node in list(soup.select(sel)):
-            # 가능한 한 "row(td/tr)" 단위로 제거
-            td = node.find_parent("td")
-            tr = node.find_parent("tr")
-
-            # td가 row 패딩(50px) 블록인 경우가 많음
-            if tr:
-                tr.decompose()
-                removed += 1
-                continue
-            if td:
-                td.decompose()
-                removed += 1
-                continue
-
-            # 최후
-            node.decompose()
-            removed += 1
-
-    return removed
-
-
-# ----------------------
-# 2) 요청한 방식: "첫 번째 FROM OUR PARTNER" 이후 첫 이모지 전까지 삭제(이모지부터는 살림)
-# ----------------------
-# 이모지(그림문자) 감지용: 대부분의 뉴스 헤더가 🚀/💻/📱 처럼 시작
-EMOJI_RE = re.compile(
-    r"[\U0001F300-\U0001FAFF\U00002700-\U000027BF\U00002600-\U000026FF]"
-)
-
-
-def _remove_first_partner_until_first_emoji(soup: BeautifulSoup) -> int:
-    """
-    - FROM OUR PARTNER가 포함된 첫 블록을 찾고
-    - 그 블록(보통 td.row 내부)에서 첫 이모지가 등장하는 지점 전까지를 삭제
-    """
-    # 1) 시작점 찾기: main-ad-title이 있으면 그게 1순위
-    start = soup.find(id="main-ad-title")
-    if not start:
-        # 없으면 텍스트 기반
-        for s in soup.find_all(string=True):
-            if isinstance(s, str) and s.strip().upper() == "FROM OUR PARTNER":
-                start = s.parent if getattr(s, "parent", None) else None
-                break
-
-    if not start:
-        return 0
-
-    container_td = start.find_parent("td")
-    if not container_td:
-        return 0
-
-    # container_td 안에서 "첫 이모지" 찾기 (partner 구간에는 보통 이모지 없음)
-    emoji_node = None
-    for s in container_td.find_all(string=True):
-        if not isinstance(s, str):
-            continue
-        if EMOJI_RE.search(s):
-            emoji_node = s
-            break
-
-    # 이모지가 없다면: 통째로 제거
-    if not emoji_node:
-        tr = container_td.find_parent("tr")
-        if tr:
-            tr.decompose()
-            return 1
-        container_td.decompose()
-        return 1
-
-    # 이모지를 포함하는 “살릴 덩어리”의 최상위(컨테이너 td의 직접 자식) 찾기
-    keep_tag = emoji_node.parent if getattr(emoji_node, "parent", None) else None
-    if not keep_tag:
-        return 0
-
-    top = keep_tag
-    while top.parent and top.parent != container_td:
-        top = top.parent
-
-    # container_td의 contents 앞부분부터 top 직전까지 삭제
-    removed = 0
-    for child in list(container_td.contents):
-        if child == top:
-            break
-        # NavigableString이면 그냥 제거, Tag면 decompose
-        try:
-            child.extract()
-        except Exception:
-            try:
-                child.decompose()
-            except Exception:
-                pass
-        removed += 1
-
-    return removed
-
-
-# ----------------------
-# 첫 번째 FROM OUR PARTNER 블록을 "원본 HTML 문자열" 단계에서 안전하게 제거
-# ----------------------
-
-# next section 시작점(대부분 이 td가 뉴스 섹션 헤더 시작)
-NEXT_SECTION_TD_RE = re.compile(
-    r'(?is)<td[^>]*style="[^"]*padding-top:\s*50px[^"]*font-weight:\s*bold[^"]*font-size:\s*17px[^"]*"[^>]*>'
-)
-
-# FROM OUR PARTNER 시작점(태그/대소문자 변형 허용)
 PARTNER_START_RE = re.compile(r"(?is)<b>\s*FROM\s+OUR\s+PARTNER\s*</b>")
+EMOJI_RE = re.compile(r"[\U0001F300-\U0001FAFF\U00002700-\U000027BF\U00002600-\U000026FF]")
 
-# 이모지(🚀📱💥 등) 감지용
-EMOJI_RE = re.compile(
-    r"[\U0001F300-\U0001FAFF\U00002700-\U000027BF\U00002600-\U000026FF]"
-)
 
-def strip_first_partner_block_html(html: str) -> str:
+def strip_first_partner_until_emoji_td(html: str) -> tuple[str, int]:
     """
-    첫 번째 'FROM OUR PARTNER' ~ (다음 섹션 시작 td) 직전까지를 삭제하고,
-    다음 섹션 시작 td부터는 그대로 살린다.
-
-    - next section td 패턴이 있으면 그걸 기준으로 컷 (가장 안정적)
-    - 없으면 'FROM OUR PARTNER' 이후 첫 이모지 위치 전까지 컷
+    첫 번째 FROM OUR PARTNER 블록을 제거하되,
+    '첫 이모지(🚀 등)'가 등장하는 지점 직전의 가장 가까운 <td ...> 시작부터 살린다.
+    => HTML 구조 깨짐 방지 + 본문 보호
     """
     if not html:
-        return html
+        return html, 0
 
     m = PARTNER_START_RE.search(html)
     if not m:
-        return html
+        return html, 0
 
     start = m.start()
-
-    # 1) 다음 섹션 td 찾기 (FROM OUR PARTNER 이후에서)
     after = html[m.end():]
-    m2 = NEXT_SECTION_TD_RE.search(after)
-    if m2:
-        cut_pos = m.end() + m2.start()  # after 기준을 원본 기준으로 환산
-        return html[:start] + html[cut_pos:]
 
-    # 2) fallback: 첫 이모지 기준 컷
-    m3 = EMOJI_RE.search(after)
-    if m3:
-        cut_pos = m.end() + m3.start()
-        return html[:start] + html[cut_pos:]
+    em = EMOJI_RE.search(after)
+    if not em:
+        # 이모지 못 찾으면: 문구만 제거(안전)
+        return PARTNER_START_RE.sub("", html, count=1), 1
 
-    # 3) 둘 다 없으면, 너무 큰 삭제 방지 위해 "FROM OUR PARTNER" 문구만 제거
-    return PARTNER_START_RE.sub("", html, count=1)
+    emoji_abs = m.end() + em.start()
 
+    # 이모지 등장 위치 이전에서 가장 가까운 "<td" 시작점을 찾아 그 지점부터 살린다
+    td_pos = html.rfind("<td", start, emoji_abs)
+    if td_pos == -1:
+        # td 못 찾으면: 이모지 위치부터 살리되, HTML이 깨질 수 있으니 최소 컷
+        return html[:start] + html[emoji_abs:], 1
+
+    # start~td_pos 사이가 파트너 블록이므로 날리고 td_pos부터 살린다
+    return html[:start] + html[td_pos:], 1
 
 
 # ----------------------
@@ -432,7 +316,10 @@ URL_RE = re.compile(r"(https?://\S+|www\.\S+)", re.IGNORECASE)
 
 
 def remove_visible_urls(soup: BeautifulSoup):
-    """텍스트로 노출된 URL만 제거해서 PDF에 URL이 보이지 않게. <a href>는 유지."""
+    """
+    '텍스트로 노출된 URL'만 제거해서 PDF에 URL이 보이지 않게.
+    <a href="...">는 건드리지 않아서 링크는 유지됨.
+    """
     for node in list(soup.find_all(string=True)):
         if not isinstance(node, NavigableString):
             continue
@@ -454,10 +341,8 @@ def remove_visible_urls(soup: BeautifulSoup):
 
 def translate_text_nodes_inplace(soup: BeautifulSoup):
     """
-    HTML 태그 구조는 그대로 유지하고 텍스트 노드만 번역.
-    - <a href> 링크 유지
-    - URL 텍스트는 표시/번역하지 않음
-    - ✅ bold/strong(도구명/고유명사 등)은 번역 제외
+    HTML 태그 구조는 그대로 유지하고, 텍스트 노드만 번역.
+    => <a href> 링크 유지 + URL은 번역/표시하지 않음
     """
     translated_nodes = 0
 
@@ -469,7 +354,7 @@ def translate_text_nodes_inplace(soup: BeautifulSoup):
         if parent in ("script", "style"):
             continue
 
-        # ✅ Trending tools bold 등은 번역 제외
+        # ✅ Trending tools 등에서 bold/strong(도구명/고유명사)은 번역 제외
         if parent in ("strong", "b"):
             continue
 
@@ -477,15 +362,15 @@ def translate_text_nodes_inplace(soup: BeautifulSoup):
         if not text.strip():
             continue
 
-        # URL이 텍스트로 들어있다면 제거
+        # URL이 텍스트로 들어있다면(혹시 남았으면) 번역 전에 제거
         if URL_RE.search(text):
             text = URL_RE.sub("", text)
 
-        # 영어 알파벳이 거의 없으면 스킵
+        # 영어 알파벳이 거의 없으면 스킵(숫자/기호/이미 한글 위주)
         if len(re.findall(r"[A-Za-z]", text)) < 2:
             continue
 
-        # 너무 긴 노드는 비용/리스크 큼
+        # 너무 긴 노드는 위험/비용 큼 → 스킵
         if len(text) > 2000:
             continue
 
@@ -500,53 +385,43 @@ def translate_text_nodes_inplace(soup: BeautifulSoup):
 
 
 def translate_html_preserve_layout(html: str, date_str: str) -> str:
-    # ✅ (가장 먼저) 첫 번째 FROM OUR PARTNER 블록을 문자열 단계에서 잘라냄
-    html = strip_first_partner_block_html(html)
+    # ✅ (가장 먼저) 문자열 단계에서 첫 FROM OUR PARTNER 제거 (본문 0 방지)
+    html, removed = strip_first_partner_until_emoji_td(html)
+    if removed:
+        print("Main partner ad removed (string->td before emoji):", removed)
 
     soup = BeautifulSoup(html, "html.parser")
 
     # 0) 헤더/푸터 제거
     _remove_techpresso_header_footer_safely(soup)
 
-    # 1) 메인 파트너 광고 제거(구조 기반)
-    removed_struct = _remove_main_partner_ad_row(soup)
-    if removed_struct:
-        print("Main partner ad removed (structure):", removed_struct)
-
-    # 2) 그래도 남아있으면(변형 대비) "FROM OUR PARTNER ~ 첫 이모지 전" 컷
-    removed_emoji = _remove_first_partner_until_first_emoji(soup)
-    if removed_emoji:
-        print("Main partner ad removed (until emoji):", removed_emoji)
-
-    # 3) 파트너 섹션(기타) 삭제(키워드 기반)
+    # 1) 파트너 섹션 삭제(두번째/세번째 등 나머지 파트너용)
     _remove_blocks_containing_keywords_safely(soup, PARTNER_KEYWORDS)
 
-    # 4) AI Academy 섹션 삭제
+    # 2) AI Academy 섹션 삭제
     _remove_blocks_containing_keywords_safely(soup, REMOVE_SECTION_KEYWORDS)
 
-    # 5) 광고 제거(기타 셀렉터)
+    # 3) 광고 제거(일반)
     for ad in soup.select("[data-testid='ad'], .sponsor, .advertisement"):
         ad.decompose()
 
-    # 6) 브랜딩 치환
+    # 4) 브랜딩 치환 (Techpresso -> OneSip)
     _replace_brand_everywhere(soup, BRAND_FROM, BRAND_TO)
 
-    # 7) URL 텍스트 제거
+    # 5) URL을 PDF에 표시하지 않도록 텍스트 URL 제거
     remove_visible_urls(soup)
 
-    # 8) 텍스트 노드 번역(링크 유지)
+    # 6) 링크 포함 '텍스트 노드만' 번역 (태그 구조 유지 → 링크 유지)
     translate_text_nodes_inplace(soup)
 
     out_html = str(soup)
 
-    # fallback: 본문이 너무 짧으면 헤더/푸터 제거 없이 다시(파트너/아카데미는 유지)
+    # fallback: 본문이 너무 짧으면 헤더/푸터 제거만 빼고 다시 (단, 첫 파트너 제거는 유지)
     text_len = len(BeautifulSoup(out_html, "html.parser").get_text(" ", strip=True))
     if text_len < 200:
         print("WARNING: HTML too small after cleanup. Falling back without header/footer removal.")
         soup2 = BeautifulSoup(html, "html.parser")
 
-        _remove_main_partner_ad_row(soup2)
-        _remove_first_partner_until_first_emoji(soup2)
         _remove_blocks_containing_keywords_safely(soup2, PARTNER_KEYWORDS)
         _remove_blocks_containing_keywords_safely(soup2, REMOVE_SECTION_KEYWORDS)
 
@@ -568,7 +443,7 @@ def translate_html_preserve_layout(html: str, date_str: str) -> str:
 
 
 # ======================
-# PDF용 HTML 래핑 + CSS
+# PDF용 HTML 래핑 + CSS (잘림 방지/여백/한글 폰트)
 # ======================
 def wrap_html_for_pdf(inner_html: str) -> str:
     css = """
@@ -621,9 +496,9 @@ def wrap_html_for_pdf(inner_html: str) -> str:
 
 
 # ======================
-# RSS → 특정 날짜 HTML 추출
+# RSS → 특정 날짜(오프셋 반영) HTML 추출
 # ======================
-def fetch_issue_html(target_date_kst):
+def fetch_issue_html_for_date(target_date_kst):
     feed = feedparser.parse(RSS_URL)
 
     for e in feed.entries:
@@ -707,11 +582,12 @@ def send_email(pdf_path: str, date_str: str):
 def main():
     safe_print_deepl_usage("DeepL usage(before)")
 
-    target_date = now_kst().date() + timedelta(days=ISSUE_OFFSET_DAYS)
-    date_str = target_date.strftime("%Y-%m-%d")
-    print("Target issue date (KST):", date_str, "offset:", ISSUE_OFFSET_DAYS)
+    target_date = target_issue_date_kst()
+    print("Target issue date (KST):", target_date, "offset:", ISSUE_DATE_OFFSET)
 
-    raw_html = fetch_issue_html(target_date)
+    date_str = target_date.strftime("%Y-%m-%d")
+
+    raw_html = fetch_issue_html_for_date(target_date)
     if not raw_html:
         print("No issue found for target date.")
         return
