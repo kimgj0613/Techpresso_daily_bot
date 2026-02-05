@@ -251,6 +251,17 @@ def _table_looks_like_issue(table: Tag) -> bool:
     return False
 
 
+def _container_has_issue_tables(tag: Tag) -> bool:
+    """컨테이너 내부에 '기사 테이블'이 있으면 True (이모지로 오판하지 않기 위해 table 기반만 봄)"""
+    try:
+        for t in tag.find_all("table"):
+            if _table_looks_like_issue(t):
+                return True
+    except Exception:
+        pass
+    return False
+
+
 def _container_has_issue_content(tag: Tag) -> bool:
     """
     이 컨테이너 안에 '기사 본문'이 들어있으면 True.
@@ -342,6 +353,44 @@ def _remove_blocks_containing_keywords_safely(soup: BeautifulSoup, keywords) -> 
             except Exception:
                 pass
 
+            parent.decompose()
+            removed += 1
+
+    return removed
+
+
+# ----------------------
+# ✅ AI Academy(🎓) 블록 제거: academy.techpresso.co 링크 기반 (정확/안전)
+# ----------------------
+def _remove_ai_academy_block_by_link(soup: BeautifulSoup) -> int:
+    """
+    🎓 AI Academy 프로모션 블록 제거
+    - 특징: academy.techpresso.co 링크가 포함됨
+    - 가능하면 tr/table 단위로 제거(레이아웃 안전)
+    - 기사 보호는 '기사 테이블 존재 여부'로만 판단 (🎓 이모지로 기사 오판 방지)
+    """
+    removed = 0
+    anchors = soup.find_all("a", href=True)
+
+    for a in anchors:
+        href = a.get("href", "") or ""
+        if "academy.techpresso.co" not in href:
+            continue
+
+        tr = a.find_parent("tr")
+        if isinstance(tr, Tag) and not _container_has_issue_tables(tr):
+            tr.decompose()
+            removed += 1
+            continue
+
+        table = a.find_parent("table")
+        if isinstance(table, Tag) and not _container_has_issue_tables(table):
+            table.decompose()
+            removed += 1
+            continue
+
+        parent = a.find_parent(["div", "section", "td", "p"])
+        if isinstance(parent, Tag) and not _container_has_issue_tables(parent):
             parent.decompose()
             removed += 1
 
@@ -507,7 +556,7 @@ def _remove_partner_block_around_text_node(n: NavigableString) -> bool:
     """
     'FROM OUR PARTNER' 텍스트 노드 주변의 광고 블록만 제거(기사 영역 보호).
     제거 우선순위:
-    1) tr (이메일 레이아웃에서 광고는 보통 tr 하나로 끝남)
+    1) tr
     2) table (단, 기사 테이블이면 제거 금지)
     3) div/section (단, 기사 컨텐츠 섞이면 제거 금지)
     """
@@ -533,7 +582,6 @@ def _remove_partner_block_around_text_node(n: NavigableString) -> bool:
     if isinstance(container, Tag):
         if not _container_has_issue_content(container):
             txt = container.get_text(" ", strip=True)
-            # 너무 큰 건 위험하니 제한
             if txt and len(txt) <= 3000:
                 container.decompose()
                 return True
@@ -554,10 +602,6 @@ def _remove_partner_block_around_text_node(n: NavigableString) -> bool:
 
 
 def _remove_partner_blocks_until_limit(soup: BeautifulSoup, max_blocks: int = 5) -> int:
-    """
-    남아있는 FROM OUR PARTNER 블록을 최대 max_blocks개까지 반복 제거.
-    (main/spotlight 제거 후에도 혹시 더 남는 케이스 대비)
-    """
     removed = 0
     for _ in range(max_blocks):
         n = _find_next_partner_text_node(soup)
@@ -566,7 +610,6 @@ def _remove_partner_blocks_until_limit(soup: BeautifulSoup, max_blocks: int = 5)
         if _remove_partner_block_around_text_node(n):
             removed += 1
             continue
-        # 제거 실패면 무한 루프 방지: 해당 텍스트만 제거하고 종료
         try:
             n.extract()
         except Exception:
@@ -718,12 +761,17 @@ def translate_html_preserve_layout(html: str, date_str: str) -> str:
         len(BeautifulSoup(str(soup), "html.parser").get_text(" ", strip=True)),
     )
 
+    # ✅ AI Academy(🎓) 링크 기반 제거 (가장 정확하고 안전)
+    removed_academy = _remove_ai_academy_block_by_link(soup)
+    if removed_academy:
+        print("AI Academy block removed by link:", removed_academy)
+
     # 1) 파트너 키워드 잔여 처리(아주 보수적으로)
     removed_partner2 = _remove_blocks_containing_keywords_safely(soup, PARTNER_KEYWORDS)
     if removed_partner2:
         print("Blocks removed by keywords (partner):", removed_partner2)
 
-    # 2) AI Academy 섹션 삭제
+    # 2) AI Academy 섹션 삭제(키워드 기반 보조)
     removed_ai = _remove_blocks_containing_keywords_safely(soup, REMOVE_SECTION_KEYWORDS)
     if removed_ai:
         print("Blocks removed by keywords (ai-academy):", removed_ai)
@@ -758,8 +806,13 @@ def translate_html_preserve_layout(html: str, date_str: str) -> str:
         print("WARNING: HTML too small after cleanup. Falling back without header/footer removal.")
         soup2 = BeautifulSoup(html, "html.parser")
 
-        # ✅ fallback에서도 partner 제거 동일 적용
+        # ✅ fallback에서도 동일 적용
         _remove_partner_everything(soup2)
+
+        removed_academy2 = _remove_ai_academy_block_by_link(soup2)
+        if removed_academy2:
+            print("AI Academy block removed by link (fallback):", removed_academy2)
+
         _remove_blocks_containing_keywords_safely(soup2, PARTNER_KEYWORDS)
         _remove_blocks_containing_keywords_safely(soup2, REMOVE_SECTION_KEYWORDS)
 
@@ -890,7 +943,7 @@ def fetch_issue_html_by_offset():
 # PDF 생성
 # ======================
 def html_to_pdf(inner_html: str, date_str: str):
-    filename = f"Gmail - OneSip_{date_str}.pdf"
+    filename = f"HCS - OneSip_{date_str}.pdf"
     final_html = wrap_html_for_pdf(inner_html)
 
     if DEBUG_DUMP_HTML:
