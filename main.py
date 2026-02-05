@@ -275,29 +275,30 @@ def _remove_blocks_containing_keywords_safely(soup: BeautifulSoup, keywords):
 
 def _remove_first_partner_main_ad(soup: BeautifulSoup) -> int:
     """
-    첫 번째 FROM OUR PARTNER (main-ad-* GitLab 광고 블록)만 정확히 제거.
-    RSS에서 확인된 id 패턴:
-      - main-ad-headline, main-ad-image-link, main-ad-image, main-ad-copy
+    첫 번째 FROM OUR PARTNER (main-ad-* 1st sponsor block) 제거.
+    케이스가 2가지:
+      - GitLab: main-ad-copy id 존재
+      - IBM: main-ad-copy id 없음 (그냥 <div>...</div> 로 이어짐)
+    해결: main-ad-headline 기준으로 다음 섹션(table) 시작 전까지 광고 블록을 통째로 제거.
     """
-    main_ad_nodes = []
-    for _id in ("main-ad-headline", "main-ad-image-link", "main-ad-image", "main-ad-copy"):
-        n = soup.find(id=_id)
-        if n:
-            main_ad_nodes.append(n)
+    def _is_section_start_table(tbl) -> bool:
+        if not tbl or getattr(tbl, "name", None) != "table":
+            return False
+        td = tbl.find("td")
+        if not td:
+            return False
+        style = (td.get("style") or "").lower()
+        # Techpresso 본문 섹션 시작이 보통 padding-top: 50px 로 시작함
+        return "padding-top: 50px" in style
 
-    if not main_ad_nodes:
+    # main-ad-headline이 있으면 "첫번째 파트너 광고"가 있다고 본다
+    headline = soup.find(id="main-ad-headline")
+    if not headline:
         return 0
 
     removed = 0
 
-    # main-ad 구성 요소 제거
-    for _id in ("main-ad-copy", "main-ad-image-link", "main-ad-headline", "main-ad-image"):
-        n = soup.find(id=_id)
-        if n:
-            n.decompose()
-            removed += 1
-
-    # 'FROM OUR PARTNER' 헤더도 같이 제거(앞부분에 붙는 경우)
+    # 1) FROM OUR PARTNER 헤더 제거 (h태그 또는 b/strong)
     for s in list(soup.find_all(string=True)):
         t = re.sub(r"\s+", " ", str(s)).strip().upper()
         if t == "FROM OUR PARTNER":
@@ -312,14 +313,78 @@ def _remove_first_partner_main_ad(soup: BeautifulSoup) -> int:
                     removed += 1
             break
 
-    # 잔여 br 정리(선택)
-    for br in soup.find_all("br")[:4]:
-        prev_txt = br.previous_sibling or ""
-        next_txt = br.next_sibling or ""
-        if (not str(prev_txt).strip()) and (not str(next_txt).strip()):
-            br.decompose()
+    # 2) main-ad 관련 id들(있으면) 제거
+    for _id in ("main-ad-copy", "main-ad-image-link", "main-ad-image", "main-ad-headline"):
+        n = soup.find(id=_id)
+        if n:
+            n.decompose()
+            removed += 1
+
+    # 3) ✅ 핵심: headline(원래 위치) 뒤에 이어지는 "광고 내용 div"도 함께 제거
+    #    - IBM 케이스: id 없는 <div>...</div>가 남아있음
+    #
+    # headline이 decompose 됐을 수 있으니, 다시 기준점을 잡는다:
+    # main-ad-image-link가 있으면 그걸, 없으면 main-ad-headline이 있었던 자리를 근처에서 찾는다.
+    anchor = soup.find(id="main-ad-image-link") or soup.find(id="main-ad-headline")
+
+    # anchor가 이미 제거돼서 못 찾으면: "FROM OUR PARTNER" 텍스트 있었던 근처를 대신 찾기 어렵다.
+    # -> headline이 제거되기 전에 sibling div들을 제거해야 안전하므로, 위에서 id 제거 전에 anchor를 잡는 게 베스트.
+    # 그래서 여기서는 anchor가 없을 때를 대비해 "main-ad-image" 기준도 한 번 더 탐색.
+    if not anchor:
+        anchor = soup.find(id="main-ad-image")
+
+    # anchor가 없으면 더 할 수 없음(이미 제거됐거나 구조가 다름)
+    if not anchor:
+        return removed
+
+    # anchor의 다음 table(섹션 시작 table)을 찾는다
+    end_table = anchor.find_next("table")
+    while end_table and not _is_section_start_table(end_table):
+        end_table = end_table.find_next("table")
+
+    # end_table이 없으면 안전하게: 다음 table 1개를 끝으로 본다
+    if not end_table:
+        end_table = anchor.find_next("table")
+
+    # anchor 이후의 형제 div/br 들을 end_table 전까지 제거
+    cur = anchor
+    for _ in range(80):  # 무한루프 방지
+        nxt = cur.next_sibling
+        # next_sibling이 None이면 다음 요소로 이동(구조상)
+        if nxt is None:
+            nxt = cur.find_next_sibling()
+
+        if nxt is None:
+            break
+
+        # end_table에 도달하면 중단
+        if getattr(nxt, "name", None) == "table" and nxt == end_table:
+            break
+
+        # 공백 문자열은 제거
+        if isinstance(nxt, NavigableString):
+            if str(nxt).strip() == "":
+                nxt.extract()
+                cur = cur  # cur 유지
+                continue
+            else:
+                nxt.extract()
+                removed += 1
+                cur = cur
+                continue
+
+        # br / div / p / ul 등 광고 구성요소는 제거
+        if getattr(nxt, "name", None) in ("br", "div", "p", "ul", "ol", "li", "span", "img", "a"):
+            nxt.decompose()
+            removed += 1
+            cur = cur  # cur 유지(계속 같은 anchor 기준으로 다음 sibling 제거)
+            continue
+
+        # 그 외 태그도 너무 공격적으로 지우면 위험 -> 한 번만 스킵하고 다음으로
+        cur = nxt
 
     return removed
+
 
 
 # ----------------------
