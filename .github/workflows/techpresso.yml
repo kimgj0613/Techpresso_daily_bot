@@ -8,8 +8,9 @@ on:
   workflow_dispatch:
 
 jobs:
-  run:
+  build-and-send:
     runs-on: ubuntu-latest
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -19,22 +20,31 @@ jobs:
         with:
           python-version: "3.11"
 
-      # ✅ 한글 폰트 + WeasyPrint 렌더링에 필요한 기본 폰트 캐시
-      - name: Install system fonts for Korean (WeasyPrint)
+      # ✅ 한글 폰트 + WeasyPrint 안정 렌더링을 위한 시스템 의존성
+      - name: Install system dependencies (fonts + WeasyPrint)
         run: |
           sudo apt-get update
-          sudo apt-get install -y fonts-noto-cjk fonts-noto-color-emoji fontconfig
+          sudo apt-get install -y \
+            fonts-noto-cjk \
+            fonts-noto-color-emoji \
+            fontconfig \
+            libpango-1.0-0 \
+            libpangoft2-1.0-0 \
+            libcairo2 \
+            libgdk-pixbuf2.0-0 \
+            libffi-dev \
+            shared-mime-info
           fc-cache -f -v
 
-      - name: Install dependencies
+      - name: Install Python dependencies
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Run script
+      - name: Run OneSip script
         env:
-          # RSS
-          RSS_URL: "https://rss.beehiiv.com/feeds/ez2zQOMePQ.xml"
+          # RSS (Secrets로 관리)
+          RSS_URL: ${{ secrets.RSS_URL }}
 
           # DeepL
           DEEPL_API_KEY: ${{ secrets.DEEPL_API_KEY }}
@@ -48,12 +58,13 @@ jobs:
           MAIL_FROM: ${{ secrets.MAIL_FROM }}
           MAIL_TO: ${{ secrets.MAIL_TO }}
 
-          # 디버그 보고 싶으면 1로 바꾸고(또는 repository variable로 관리)
-          DEBUG_DUMP_HTML: "1"
+          # GitHub Variables로 관리 (기본 0)
+          DEBUG_DUMP_HTML: ${{ vars.DEBUG_DUMP_HTML }}
+
         run: |
           python main.py
 
-      # ✅ 실패/성공 상관없이 결과물 확인 가능하게 아티팩트 업로드
+      # ✅ 성공/실패 관계없이 결과물 확인 가능
       - name: Upload artifacts (pdf/html)
         if: always()
         uses: actions/upload-artifact@v4
