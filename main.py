@@ -33,11 +33,11 @@ BRAND_TO = "OneSip"
 # 번역에서 절대 건드리면 안 되는 단어(브랜드/고유명사)
 PROTECT_TERMS = ["OneSip"]
 
-# ✅ 0이면 당일, -1이면 하루 전, -2이면 이틀 전...
-ISSUE_OFFSET_DAYS = int(os.getenv("ISSUE_OFFSET_DAYS", "0"))
-
 # 디버그: GitHub Actions에서 HTML/PDF를 아티팩트로 보고 싶으면 1
 DEBUG_DUMP_HTML = os.getenv("DEBUG_DUMP_HTML", "0") == "1"
+
+# ✅ 0이면 당일, -1이면 전날, -2이면 이틀 전...
+ISSUE_OFFSET_DAYS = int(os.getenv("ISSUE_OFFSET_DAYS", "0"))
 
 KST = tz.gettz("Asia/Seoul")
 
@@ -53,6 +53,10 @@ def now_kst():
     return datetime.now(tz=KST)
 
 
+def get_target_issue_date_kst() -> datetime.date:
+    return (now_kst().date() + timedelta(days=ISSUE_OFFSET_DAYS))
+
+
 def safe_print_deepl_usage(prefix="DeepL usage"):
     if not translator:
         return
@@ -63,10 +67,28 @@ def safe_print_deepl_usage(prefix="DeepL usage"):
         print("DeepL usage check failed:", e)
 
 
+def _safe_find_parent(node, names):
+    """
+    BeautifulSoup 노드가 분리되었거나( decompose 이후 ),
+    일부 환경에서 NavigableString parent 접근 에러가 날 수 있어서
+    find_parent는 무조건 안전하게 감싼다.
+    """
+    try:
+        if hasattr(node, "find_parent"):
+            return node.find_parent(names)
+    except Exception:
+        return None
+    return None
+
+
 # ======================
 # 번역 보호(placeholder)
 # ======================
 def protect_terms(text: str):
+    """
+    OneSip 같은 단어가 번역되지 않게 placeholder로 바꾸고,
+    번역 후 다시 되돌릴 수 있게 매핑을 반환한다.
+    """
     if not text:
         return text, {}
 
@@ -132,6 +154,7 @@ def translate_text(text: str, retries: int = 3) -> str:
         raise ValueError("DEEPL_API_KEY가 설정되지 않았습니다.")
 
     protected, mapping = protect_terms(text)
+
     chunks = _split_by_paragraph(protected, max_chars=4500)
     if not chunks:
         return text
@@ -174,7 +197,6 @@ REMOVE_KEYWORDS_HEADER_FOOTER = [
 
 REMOVE_SECTION_KEYWORDS = [
     "Want to master the AI tools we cover every day?",
-    "AI Academy",
     "매일 다루는 AI 도구를 마스터하고 싶으신가요?",
     "AI 아카데미",
 ]
@@ -207,11 +229,7 @@ def _remove_techpresso_header_footer_safely(soup: BeautifulSoup):
     """
     candidates = soup.find_all(["header", "footer", "div", "section", "table", "tr", "td"])
     for tag in candidates:
-        try:
-            text = tag.get_text(" ", strip=True)
-        except Exception:
-            continue
-
+        text = tag.get_text(" ", strip=True)
         if not text:
             continue
 
@@ -222,6 +240,7 @@ def _remove_techpresso_header_footer_safely(soup: BeautifulSoup):
         if len(text) > 1600:
             continue
 
+        # div/section/table/tr/td는 너무 과감하면 본문까지 날아가서 kw>=2일 때만
         if tag.name in ["div", "section", "table", "tr", "td"]:
             if kw >= 2:
                 tag.decompose()
@@ -229,187 +248,220 @@ def _remove_techpresso_header_footer_safely(soup: BeautifulSoup):
             tag.decompose()
 
 
-def _find_ancestor_tag(node, names):
-    """
-    node에서 시작해서 부모로 올라가며 names 중 하나인 태그를 찾는다.
-    bs4의 find_parent()를 안 쓰고, 직접 parent 체인을 타서
-    NavigableString parent 관련 예외를 근본적으로 회피한다.
-    """
-    try:
-        cur = getattr(node, "parent", None)
-    except Exception:
-        return None
-
-    steps = 0
-    while cur is not None and steps < 30:
-        try:
-            if getattr(cur, "name", None) in names:
-                return cur
-            cur = getattr(cur, "parent", None)
-        except Exception:
-            return None
-        steps += 1
-    return None
-
-
-def _remove_blocks_containing_keywords_safely(soup: BeautifulSoup, keywords):
+def _remove_blocks_containing_keywords_safely(soup: BeautifulSoup, keywords) -> int:
     """
     keywords가 포함된 블록을 삭제하되,
-    div/section 우선 삭제, table은 작은 경우만 삭제.
-    find_parent() 대신 안전한 parent 체인 탐색으로 예외 방지.
+    table/tr/td를 바로 지우면 다른 섹션까지 같이 날아갈 수 있어서
+    기본은 div/section을 우선 삭제하고, table은 '작은' 경우에만 삭제.
     """
-    nodes = list(soup.find_all(string=True))  # 스냅샷
-
     removed = 0
-    for node in nodes:
-        # ✅ NavigableString만 취급 (일반 str은 parent가 없음)
+    for node in list(soup.find_all(string=True)):
+        # NavigableString도 str의 subclass라서 그냥 str 검사만 하면 위험.
         if not isinstance(node, NavigableString):
             continue
 
-        # node가 이미 분리된 경우가 있어서, 텍스트만 안전하게 읽기
-        try:
-            node_text = str(node)
-        except Exception:
+        text = str(node)
+        if not text.strip():
             continue
-
-        if not _text_has_any(node_text, keywords):
+        if not _text_has_any(text, keywords):
             continue
 
         # 1) div/section 우선
-        container = _find_ancestor_tag(node, {"div", "section"})
+        container = _safe_find_parent(node, ["div", "section"])
         if container:
-            try:
-                txt = container.get_text(" ", strip=True)
-            except Exception:
-                txt = ""
+            txt = container.get_text(" ", strip=True)
             if txt and len(txt) <= 6000:
-                try:
-                    container.decompose()
-                    removed += 1
-                except Exception:
-                    pass
-                continue
-
-        # 2) table(짧을 때만)
-        table = _find_ancestor_tag(node, {"table"})
-        if table:
-            try:
-                txt = table.get_text(" ", strip=True)
-            except Exception:
-                txt = ""
-            if txt and len(txt) <= 3500:
-                try:
-                    table.decompose()
-                    removed += 1
-                except Exception:
-                    pass
-                continue
-
-        # 3) fallback: 주변 작은 태그만 제거
-        try:
-            parent = getattr(node, "parent", None)
-        except Exception:
-            parent = None
-
-        if parent and getattr(parent, "name", None) in ("p", "h1", "h2", "h3", "h4", "td"):
-            try:
-                parent.decompose()
+                container.decompose()
                 removed += 1
-            except Exception:
-                pass
+                continue
 
-    if removed:
-        print("Blocks removed by keywords:", removed)
+        # 2) table (짧을 때만)
+        table = _safe_find_parent(node, "table")
+        if table:
+            txt = table.get_text(" ", strip=True)
+            if txt and len(txt) <= 3500:
+                table.decompose()
+                removed += 1
+                continue
+
+        # 3) 마지막 fallback: 주변 문단/셀만 제거
+        parent = getattr(node, "parent", None)
+        if parent and getattr(parent, "name", "") in ("p", "h1", "h2", "h3", "h4", "td"):
+            parent.decompose()
+            removed += 1
+
+    return removed
 
 
 # ----------------------
-# ✅ 첫번째 FROM OUR PARTNER: "FROM OUR PARTNER" ~ "첫 이모지" 직전까지 문자열로 안전 컷
+# (핵심) 첫 번째 FROM OUR PARTNER 제거: "다음 첫 이모지" 전까지 삭제
 # ----------------------
-# 대부분의 뉴스 이모지: 🚀💥📱📈🖥️📚🎁🧰 등
+# 이모지 대략 범위(뉴스 헤더에 나오는 🚀💥📱📈🖥️📚🎁🧰 등 포함)
 EMOJI_RE = re.compile(
-    "["  # wide unicode ranges
-    "\U0001F300-\U0001FAFF"  # emoticons, symbols, transport, supplemental symbols
-    "\U00002700-\U000027BF"  # dingbats
-    "\U00002600-\U000026FF"  # misc symbols
+    "["
+    "\U0001F300-\U0001F5FF"  # Misc Symbols and Pictographs
+    "\U0001F600-\U0001F64F"  # Emoticons
+    "\U0001F680-\U0001F6FF"  # Transport & Map
+    "\U0001F700-\U0001F77F"
+    "\U0001F780-\U0001F7FF"
+    "\U0001F800-\U0001F8FF"
+    "\U0001F900-\U0001F9FF"  # Supplemental Symbols and Pictographs
+    "\U0001FA00-\U0001FAFF"  # Symbols and Pictographs Extended-A
+    "\u2600-\u26FF"          # Misc symbols
+    "\u2700-\u27BF"          # Dingbats
     "]+"
 )
 
-def strip_first_partner_until_emoji(html: str) -> tuple[str, int]:
-    """
-    첫 번째 'FROM OUR PARTNER' 시작 지점부터,
-    그 이후 처음 등장하는 이모지(🚀💥📱...) 바로 직전까지를 통째로 삭제.
-    - HTML 태그를 반쯤 잘라먹지 않도록 'FROM OUR PARTNER'가 들어있는 <b>/<strong>/<h*> 시작점으로 당겨서 컷
-    - 이모지가 없으면 아무것도 안 함
-    """
-    if not html:
-        return html, 0
 
-    low = html.lower()
-    key = "from our partner"
-    kpos = low.find(key)
-    if kpos < 0:
-        return html, 0
-
-    m = EMOJI_RE.search(html, kpos)
-    if not m:
-        return html, 0
-
-    emoji_pos = m.start()
-
-    # 컷 시작점을 '<b' 또는 '<strong' 또는 '<h'로 당겨서, 태그 중간 컷 방지
-    start_candidates = []
-    for token in ("<b", "<strong", "<h"):
-        p = low.rfind(token, 0, kpos)
-        if p != -1 and (kpos - p) < 300:
-            start_candidates.append(p)
-
-    start_pos = max(start_candidates) if start_candidates else kpos
-
-    new_html = html[:start_pos] + html[emoji_pos:]
-    return new_html, 1
-
-
-def _force_left_align_around_first_story(soup: BeautifulSoup):
-    """
-    파트너 영역 삭제 후 첫 기사(이모지로 시작하는 td)가
-    가운데로 밀리는 현상 방지:
-    - 첫 이모지를 포함한 td와 그 조상들의 center 정렬을 left로 리셋
-    """
-    first_emoji_node = None
+def _find_first_partner_marker_node(soup: BeautifulSoup):
     for s in soup.find_all(string=True):
         if not isinstance(s, NavigableString):
             continue
-        if EMOJI_RE.search(str(s)):
-            first_emoji_node = s
+        if "from our partner" in str(s).lower():
+            return s
+    return None
+
+
+def _find_first_emoji_node_after(start_node: NavigableString):
+    """
+    start_node 이후 문서 순서에서 처음 이모지가 포함된 텍스트 노드를 찾는다.
+    """
+    try:
+        it = start_node.next_elements
+    except Exception:
+        return None
+
+    for el in it:
+        if not isinstance(el, NavigableString):
+            continue
+        t = str(el)
+        if not t.strip():
+            continue
+        if EMOJI_RE.search(t):
+            return el
+    return None
+
+
+def _remove_first_partner_until_emoji(soup: BeautifulSoup) -> int:
+    """
+    첫 번째 FROM OUR PARTNER 가 등장하면,
+    다음 첫 이모지 텍스트 노드가 나올 때까지 DOM 상의 요소들을 제거한다.
+    (이모지부터는 살린다)
+    """
+    marker = _find_first_partner_marker_node(soup)
+    if not marker:
+        return 0
+
+    emoji_node = _find_first_emoji_node_after(marker)
+    if not emoji_node:
+        # 이모지를 못 찾으면 과감 삭제가 위험하니 제거 안 함
+        return 0
+
+    end_tag = _safe_find_parent(emoji_node, ["td", "div", "p", "h1", "h2", "h3", "h4", "section"])
+    if not end_tag:
+        return 0
+
+    # start_tag는 marker가 속한 "적당히 작은" 컨테이너부터 잡는다.
+    # (h4/td/div 순으로 시도)
+    start_tag = _safe_find_parent(marker, ["h1", "h2", "h3", "h4", "td", "div", "section"])
+    if not start_tag:
+        return 0
+
+    # end_tag의 조상은 제거 대상에서 제외(부모를 지우면 end_tag까지 같이 날아감)
+    end_ancestors = set()
+    cur = end_tag
+    while cur is not None:
+        end_ancestors.add(cur)
+        cur = getattr(cur, "parent", None)
+
+    removed = 0
+    # start_tag부터 end_tag 직전까지, 문서 순서상 요소들을 모아서 제거
+    to_kill = []
+    for el in start_tag.next_elements:
+        if el == end_tag:
+            break
+        if not hasattr(el, "name"):
+            continue  # 문자열 등
+        if el in end_ancestors:
+            continue
+        # html/body는 제외
+        if getattr(el, "name", "") in ("html", "body"):
+            continue
+        to_kill.append(el)
+
+    # start_tag 자체도 제거(단, end_tag의 조상이면 안 됨)
+    if start_tag not in end_ancestors:
+        to_kill.insert(0, start_tag)
+
+    # 중복 제거(깊은 자식부터 제거되는 걸 막기 위해 고유화)
+    seen = set()
+    uniq = []
+    for t in to_kill:
+        if t in seen:
+            continue
+        seen.add(t)
+        uniq.append(t)
+
+    for t in uniq:
+        try:
+            t.decompose()
+            removed += 1
+        except Exception:
+            pass
+
+    return removed
+
+
+def _fix_first_article_alignment(soup: BeautifulSoup):
+    """
+    첫 파트너 블록을 제거한 뒤, 첫 기사(이모지로 시작)가
+    가운데 정렬처럼 보이는 현상을 완화하기 위해
+    첫 이모지 헤더의 td/부모의 center 관련 속성을 제거하고 left로 강제.
+    """
+    # 첫 이모지 텍스트 노드 찾기
+    first_emoji_str = None
+    for s in soup.find_all(string=True):
+        if not isinstance(s, NavigableString):
+            continue
+        t = str(s).strip()
+        if not t:
+            continue
+        if EMOJI_RE.search(t):
+            first_emoji_str = s
             break
 
-    if not first_emoji_node:
+    if not first_emoji_str:
         return
 
-    td = first_emoji_node.find_parent("td") if hasattr(first_emoji_node, "find_parent") else None
-    if td:
-        style = td.get("style", "")
-        if "text-align" not in style.lower():
-            td["style"] = (style + "; text-align:left;").strip(";")
-        else:
-            td["style"] = re.sub(r"text-align\s*:\s*center", "text-align:left", style, flags=re.I)
+    td = _safe_find_parent(first_emoji_str, "td")
+    if not td:
+        return
 
-    # 조상 쪽에 center/align=center 있으면 제거/덮어쓰기
-    cur = td if td else getattr(first_emoji_node, "parent", None)
-    steps = 0
-    while cur is not None and getattr(cur, "name", None) and steps < 10:
+    # td 및 상위 몇 단계에서 align/style의 center 제거
+    cur = td
+    for _ in range(5):
+        if not cur or not hasattr(cur, "attrs"):
+            break
+
         if cur.has_attr("align") and str(cur["align"]).lower() == "center":
             del cur["align"]
 
-        if cur.has_attr("style"):
-            st = cur["style"]
-            st2 = re.sub(r"text-align\s*:\s*center\s*;?", "", st, flags=re.I)
-            st2 = st2.strip()
-            if st2 != st:
-                cur["style"] = st2
+        style = cur.get("style", "")
+        if style:
+            style2 = re.sub(r"text-align\s*:\s*center\s*;?", "", style, flags=re.I)
+            style2 = style2.strip()
+            if style2:
+                cur["style"] = style2
+            else:
+                if cur.has_attr("style"):
+                    del cur["style"]
 
-        cur = cur.parent
-        steps += 1
+        cur = getattr(cur, "parent", None)
+
+    # td는 left로 명시
+    td_style = td.get("style", "")
+    if "text-align" not in td_style.lower():
+        td["style"] = (td_style + "; " if td_style else "") + "text-align: left !important;"
 
 
 # ----------------------
@@ -419,12 +471,17 @@ URL_RE = re.compile(r"(https?://\S+|www\.\S+)", re.IGNORECASE)
 
 
 def remove_visible_urls(soup: BeautifulSoup):
+    """
+    '텍스트로 노출된 URL'만 제거해서 PDF에 URL이 보이지 않게.
+    <a href="...">는 건드리지 않아서 링크는 유지됨.
+    """
     for node in list(soup.find_all(string=True)):
         if not isinstance(node, NavigableString):
             continue
 
-        parent = node.parent.name if getattr(node, "parent", None) else ""
-        if parent in ("script", "style"):
+        parent = getattr(node, "parent", None)
+        parent_name = parent.name if parent else ""
+        if parent_name in ("script", "style"):
             continue
 
         txt = str(node)
@@ -439,30 +496,38 @@ def remove_visible_urls(soup: BeautifulSoup):
 
 
 def translate_text_nodes_inplace(soup: BeautifulSoup):
+    """
+    HTML 태그 구조는 그대로 유지하고, 텍스트 노드만 번역.
+    => <a href> 링크 유지 + URL은 번역/표시하지 않음
+    """
     translated_nodes = 0
 
     for node in list(soup.find_all(string=True)):
         if not isinstance(node, NavigableString):
             continue
 
-        parent_tag = node.parent.name if getattr(node, "parent", None) else ""
-        if parent_tag in ("script", "style"):
+        parent = getattr(node, "parent", None)
+        parent_name = parent.name if parent else ""
+        if parent_name in ("script", "style"):
             continue
 
-        # ✅ bold/strong(도구명/고유명사)은 번역 제외
-        if parent_tag in ("strong", "b"):
+        # ✅ Trending tools 등에서 bold/strong(도구명/고유명사)은 번역 제외
+        if parent_name in ("strong", "b"):
             continue
 
         text = str(node)
         if not text.strip():
             continue
 
+        # URL이 텍스트로 들어있다면(혹시 남았으면) 번역 전에 제거
         if URL_RE.search(text):
             text = URL_RE.sub("", text)
 
+        # 영어 알파벳이 거의 없으면 스킵(숫자/기호/이미 한글 위주)
         if len(re.findall(r"[A-Za-z]", text)) < 2:
             continue
 
+        # 너무 긴 노드는 위험/비용 큼 → 스킵
         if len(text) > 2000:
             continue
 
@@ -476,56 +541,67 @@ def translate_text_nodes_inplace(soup: BeautifulSoup):
     print("Translated text nodes:", translated_nodes)
 
 
-def translate_html_preserve_layout(raw_html: str, date_str: str) -> str:
-    # ✅ 0) 문자열 단계에서 "첫 FROM OUR PARTNER ~ 첫 이모지" 컷
-    pre_html, cut = strip_first_partner_until_emoji(raw_html)
-    if cut:
-        print("Main partner ad removed (until emoji):", cut)
+def translate_html_preserve_layout(html: str, date_str: str) -> str:
+    soup = BeautifulSoup(html, "html.parser")
 
-    soup = BeautifulSoup(pre_html, "html.parser")
-
-    # 1) 헤더/푸터 제거
+    # 0) 헤더/푸터 제거
     _remove_techpresso_header_footer_safely(soup)
 
-    # 2) 기타 파트너 섹션 삭제(남아있는 FROM OUR PARTNER 블록들)
-    _remove_blocks_containing_keywords_safely(soup, PARTNER_KEYWORDS)
+    # 1) 첫 번째 FROM OUR PARTNER: 다음 첫 이모지 전까지 제거
+    removed_until_emoji = _remove_first_partner_until_emoji(soup)
+    if removed_until_emoji:
+        print("Main partner ad removed (until emoji):", removed_until_emoji)
+
+    # 2) 기타 파트너 섹션 삭제(남아있는 FROM OUR PARTNER가 더 있으면)
+    removed_partner_keywords = _remove_blocks_containing_keywords_safely(soup, PARTNER_KEYWORDS)
+    if removed_partner_keywords:
+        print("Blocks removed by keywords (partner):", removed_partner_keywords)
 
     # 3) AI Academy 섹션 삭제
-    _remove_blocks_containing_keywords_safely(soup, REMOVE_SECTION_KEYWORDS)
+    removed_ai = _remove_blocks_containing_keywords_safely(soup, REMOVE_SECTION_KEYWORDS)
+    if removed_ai:
+        print("Blocks removed by keywords (ai-academy):", removed_ai)
 
     # 4) 광고 제거
     for ad in soup.select("[data-testid='ad'], .sponsor, .advertisement"):
-        ad.decompose()
+        try:
+            ad.decompose()
+        except Exception:
+            pass
 
     # 5) 브랜딩 치환 (Techpresso -> OneSip)
     _replace_brand_everywhere(soup, BRAND_FROM, BRAND_TO)
 
-    # 6) URL 텍스트 노출 제거
-    remove_visible_urls(soup)
+    # 6) 첫 기사 얼라인 보정
+    _fix_first_article_alignment(soup)
 
-    # ✅ 7) 파트너 컷 이후 첫 기사 정렬 깨짐 방지(왼쪽 정렬 강제)
-    _force_left_align_around_first_story(soup)
+    # 7) URL을 PDF에 표시하지 않도록 텍스트 URL 제거
+    remove_visible_urls(soup)
 
     # 8) 텍스트 노드만 번역
     translate_text_nodes_inplace(soup)
 
     out_html = str(soup)
 
-    # fallback: 본문이 너무 짧으면(= 과삭제) 헤더/푸터 제거만 제외하고 재시도
+    # fallback: 본문이 너무 짧으면(과삭제) -> partner 제거만 유지하고 헤더/푸터 제거는 풀어본다
     text_len = len(BeautifulSoup(out_html, "html.parser").get_text(" ", strip=True))
     if text_len < 200:
         print("WARNING: HTML too small after cleanup. Falling back without header/footer removal.")
-        soup2 = BeautifulSoup(pre_html, "html.parser")
+        soup2 = BeautifulSoup(html, "html.parser")
 
+        _remove_first_partner_until_emoji(soup2)
         _remove_blocks_containing_keywords_safely(soup2, PARTNER_KEYWORDS)
         _remove_blocks_containing_keywords_safely(soup2, REMOVE_SECTION_KEYWORDS)
 
         for ad in soup2.select("[data-testid='ad'], .sponsor, .advertisement"):
-            ad.decompose()
+            try:
+                ad.decompose()
+            except Exception:
+                pass
 
         _replace_brand_everywhere(soup2, BRAND_FROM, BRAND_TO)
+        _fix_first_article_alignment(soup2)
         remove_visible_urls(soup2)
-        _force_left_align_around_first_story(soup2)
         translate_text_nodes_inplace(soup2)
 
         out_html = str(soup2)
@@ -539,7 +615,7 @@ def translate_html_preserve_layout(raw_html: str, date_str: str) -> str:
 
 
 # ======================
-# PDF용 HTML 래핑 + CSS
+# PDF용 HTML 래핑 + CSS (잘림 방지/여백/한글 폰트)
 # ======================
 def wrap_html_for_pdf(inner_html: str) -> str:
     css = """
@@ -592,9 +668,9 @@ def wrap_html_for_pdf(inner_html: str) -> str:
 
 
 # ======================
-# RSS → 특정 날짜 HTML 추출
+# RSS → 타겟 날짜 HTML 추출
 # ======================
-def fetch_issue_html(target_date_kst):
+def fetch_issue_html_for_date(target_date_kst):
     feed = feedparser.parse(RSS_URL)
 
     for e in feed.entries:
@@ -653,10 +729,11 @@ def send_email(pdf_path: str, date_str: str):
     msg["From"] = mail_from
     msg["To"] = mail_to
 
+    # ✅ 문구 세련되게
     msg.set_content(
         f"{MAIL_BODY_LINE}\n\n"
-        "오늘의 Tech Issue를 OneSip으로 담았습니다.\n"
-        "가볍게 읽어보시고 하루를 시작해보세요 ☕️"
+        f"오늘의 Tech Issue를 OneSip으로 담았습니다.\n"
+        f"가볍게 읽어보시고 하루를 시작해보세요 ☕️"
     )
 
     with open(pdf_path, "rb") as f:
@@ -679,12 +756,11 @@ def send_email(pdf_path: str, date_str: str):
 def main():
     safe_print_deepl_usage("DeepL usage(before)")
 
-    target_date = now_kst().date() + timedelta(days=ISSUE_OFFSET_DAYS)
+    target_date = get_target_issue_date_kst()
     date_str = target_date.strftime("%Y-%m-%d")
-
     print(f"Target issue date (KST): {date_str} offset: {ISSUE_OFFSET_DAYS}")
 
-    raw_html = fetch_issue_html(target_date)
+    raw_html = fetch_issue_html_for_date(target_date)
     if not raw_html:
         print("No issue found for target date.")
         return
