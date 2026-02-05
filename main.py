@@ -37,7 +37,7 @@ PROTECT_TERMS = ["OneSip"]
 DEBUG_DUMP_HTML = os.getenv("DEBUG_DUMP_HTML", "0") == "1"
 
 # 날짜 오프셋(0=당일, -1=어제, -2=그제 ...)
-ISSUE_DATE_OFFSET = int(os.getenv("ISSUE_DATE_OFFSET", "0"))
+ISSUE_DATE_OFFSET = int(os.getenv("ISSUE_OFFSET_DAYS", "0"))
 
 KST = tz.gettz("Asia/Seoul")
 
