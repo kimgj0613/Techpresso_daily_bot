@@ -366,8 +366,8 @@ def _remove_first_partner_block_until_first_issue_table(soup: BeautifulSoup) -> 
     시작: main-ad-title(또는 FROM OUR PARTNER 마커)
     끝: 그 다음 '첫 기사 테이블' 시작 직전까지
 
-    ✅ 테이블 자체는 삭제하지 않음(= 절대 첫 기사까지 안 잘림)
-    ✅ 타입 A/B 모두 대응
+    ✅ 공통 부모(LCA) 내부에서 "형제 구간"만 제거해서
+       광고 블록 부모 div가 이메일 전체를 감싸더라도 본문이 통째로 삭제되지 않음.
     """
     marker = _find_partner_marker_tag(soup)
     if not marker:
@@ -377,65 +377,65 @@ def _remove_first_partner_block_until_first_issue_table(soup: BeautifulSoup) -> 
     if not issue_table:
         return 0
 
-    # marker에서 위로 올라가며 "광고 블록의 시작 컨테이너"를 잡는다.
-    # (보통 div/section 안에 묶여 있음)
-    start_block = marker
-    parent_div = marker.find_parent(["div", "section"])
-    if parent_div:
-        start_block = parent_div
-
-    removed = 0
-
-    # 1) start_block과 issue_table이 같은 parent 아래 있으면: 그 parent의 contents 기준으로 구간 제거
-    if start_block.parent is not None and issue_table.parent is not None and start_block.parent == issue_table.parent:
-        siblings = list(start_block.parent.contents)
+    # 1) issue_table 기준으로 위로 올라가며 marker를 포함하는 "공통 부모" 찾기
+    common_parent = issue_table
+    while common_parent is not None:
         try:
-            i = siblings.index(start_block)
-            j = siblings.index(issue_table)
-        except ValueError:
-            i = j = -1
+            # marker가 common_parent 내부에 포함되는지 확인
+            if marker in common_parent.descendants:
+                break
+        except Exception:
+            pass
+        common_parent = common_parent.parent
 
-        if i != -1 and j != -1 and i < j:
-            for node in siblings[i:j]:
-                if isinstance(node, NavigableString) and not str(node).strip():
-                    node.extract()
-                    continue
-                try:
-                    node.decompose()
-                except Exception:
-                    try:
-                        node.extract()
-                    except Exception:
-                        pass
-                removed += 1
-            return removed
+    if common_parent is None:
+        return 0
 
-    # 2) fallback: start_block부터 다음 형제들을 issue_table 직전까지 제거
-    cur = start_block
-    while cur is not None and cur != issue_table:
-        nxt = cur.next_sibling
-        # 공백 문자열은 제거만
-        if isinstance(cur, NavigableString):
-            if not str(cur).strip():
-                cur.extract()
+    # 2) common_parent 바로 아래 레벨에서 marker를 포함하는 direct child(start_child) 찾기
+    start_child = marker
+    while start_child.parent is not None and start_child.parent != common_parent:
+        start_child = start_child.parent
+
+    # 3) common_parent 바로 아래 레벨에서 issue_table을 포함하는 direct child(end_child) 찾기
+    end_child = issue_table
+    while end_child.parent is not None and end_child.parent != common_parent:
+        end_child = end_child.parent
+
+    # 4) common_parent.contents에서 start_child ~ end_child 직전까지 삭제
+    removed = 0
+    siblings = list(common_parent.contents)
+
+    try:
+        i = siblings.index(start_child)
+        j = siblings.index(end_child)
+    except ValueError:
+        return 0
+
+    if i >= j:
+        return 0
+
+    for node in siblings[i:j]:
+        # 공백 문자열은 extract로 처리
+        if isinstance(node, NavigableString):
+            if str(node).strip() == "":
+                node.extract()
             else:
-                cur.extract()
+                node.extract()
                 removed += 1
-        else:
+            continue
+
+        # Tag는 decompose
+        try:
+            node.decompose()
+        except Exception:
             try:
-                cur.decompose()
-                removed += 1
+                node.extract()
             except Exception:
-                try:
-                    cur.extract()
-                    removed += 1
-                except Exception:
-                    pass
-        if nxt is None:
-            break
-        cur = nxt
+                pass
+        removed += 1
 
     return removed
+
 
 
 def _ensure_first_issue_left_align(soup: BeautifulSoup):
@@ -542,6 +542,9 @@ def translate_html_preserve_layout(html: str, date_str: str) -> str:
 
     # ✅ 0.5) 첫 번째 FROM OUR PARTNER 블록(광고)을 "첫 기사 테이블 직전"까지 통째로 삭제
     removed_partner = _remove_first_partner_block_until_first_issue_table(soup)
+    print("After partner removal text length:",
+      len(BeautifulSoup(str(soup), "html.parser").get_text(" ", strip=True)))
+
     if removed_partner:
         print("Main partner block removed (until first issue table):", removed_partner)
 
