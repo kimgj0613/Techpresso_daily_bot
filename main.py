@@ -374,6 +374,58 @@ def _remove_first_partner_until_first_emoji(soup: BeautifulSoup) -> int:
 
 
 # ----------------------
+# 첫 번째 FROM OUR PARTNER 블록을 "원본 HTML 문자열" 단계에서 안전하게 제거
+# ----------------------
+
+# next section 시작점(대부분 이 td가 뉴스 섹션 헤더 시작)
+NEXT_SECTION_TD_RE = re.compile(
+    r'(?is)<td[^>]*style="[^"]*padding-top:\s*50px[^"]*font-weight:\s*bold[^"]*font-size:\s*17px[^"]*"[^>]*>'
+)
+
+# FROM OUR PARTNER 시작점(태그/대소문자 변형 허용)
+PARTNER_START_RE = re.compile(r"(?is)<b>\s*FROM\s+OUR\s+PARTNER\s*</b>")
+
+# 이모지(🚀📱💥 등) 감지용
+EMOJI_RE = re.compile(
+    r"[\U0001F300-\U0001FAFF\U00002700-\U000027BF\U00002600-\U000026FF]"
+)
+
+def strip_first_partner_block_html(html: str) -> str:
+    """
+    첫 번째 'FROM OUR PARTNER' ~ (다음 섹션 시작 td) 직전까지를 삭제하고,
+    다음 섹션 시작 td부터는 그대로 살린다.
+
+    - next section td 패턴이 있으면 그걸 기준으로 컷 (가장 안정적)
+    - 없으면 'FROM OUR PARTNER' 이후 첫 이모지 위치 전까지 컷
+    """
+    if not html:
+        return html
+
+    m = PARTNER_START_RE.search(html)
+    if not m:
+        return html
+
+    start = m.start()
+
+    # 1) 다음 섹션 td 찾기 (FROM OUR PARTNER 이후에서)
+    after = html[m.end():]
+    m2 = NEXT_SECTION_TD_RE.search(after)
+    if m2:
+        cut_pos = m.end() + m2.start()  # after 기준을 원본 기준으로 환산
+        return html[:start] + html[cut_pos:]
+
+    # 2) fallback: 첫 이모지 기준 컷
+    m3 = EMOJI_RE.search(after)
+    if m3:
+        cut_pos = m.end() + m3.start()
+        return html[:start] + html[cut_pos:]
+
+    # 3) 둘 다 없으면, 너무 큰 삭제 방지 위해 "FROM OUR PARTNER" 문구만 제거
+    return PARTNER_START_RE.sub("", html, count=1)
+
+
+
+# ----------------------
 # URL 표시 제거 + 링크 유지 번역
 # ----------------------
 URL_RE = re.compile(r"(https?://\S+|www\.\S+)", re.IGNORECASE)
@@ -448,6 +500,9 @@ def translate_text_nodes_inplace(soup: BeautifulSoup):
 
 
 def translate_html_preserve_layout(html: str, date_str: str) -> str:
+    # ✅ (가장 먼저) 첫 번째 FROM OUR PARTNER 블록을 문자열 단계에서 잘라냄
+    html = strip_first_partner_block_html(html)
+
     soup = BeautifulSoup(html, "html.parser")
 
     # 0) 헤더/푸터 제거
