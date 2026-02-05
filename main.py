@@ -33,12 +33,12 @@ BRAND_TO = "OneSip"
 # 번역에서 절대 건드리면 안 되는 단어(브랜드/고유명사)
 PROTECT_TERMS = ["OneSip"]
 
+# GitHub Variables(권장) 또는 env로 설정:
+# 0이면 당일, -1이면 하루 전, -2이면 이틀 전...
+ISSUE_OFFSET_DAYS = int(os.getenv("ISSUE_OFFSET_DAYS", "0"))
+
 # 디버그: GitHub Actions에서 HTML/PDF를 아티팩트로 보고 싶으면 1
 DEBUG_DUMP_HTML = os.getenv("DEBUG_DUMP_HTML", "0") == "1"
-
-# ✅ 발행본 날짜 오프셋 (GitHub Variables로 제어)
-#  0: 오늘(KST 기준), -1: 어제, -2: 그제 ...
-ISSUE_OFFSET_DAYS_RAW = os.getenv("ISSUE_OFFSET_DAYS", "0").strip()
 
 KST = tz.gettz("Asia/Seoul")
 
@@ -52,15 +52,6 @@ if DEEPL_API_KEY:
 # ======================
 def now_kst():
     return datetime.now(tz=KST)
-
-
-def get_issue_offset_days() -> int:
-    raw = ISSUE_OFFSET_DAYS_RAW
-    try:
-        return int(raw)
-    except ValueError:
-        print("Invalid ISSUE_OFFSET_DAYS, using 0:", raw)
-        return 0
 
 
 def safe_print_deepl_usage(prefix="DeepL usage"):
@@ -77,10 +68,7 @@ def safe_print_deepl_usage(prefix="DeepL usage"):
 # 번역 보호(placeholder)
 # ======================
 def protect_terms(text: str):
-    """
-    OneSip 같은 단어가 번역되지 않게 placeholder로 바꾸고,
-    번역 후 다시 되돌릴 수 있게 매핑을 반환한다.
-    """
+    """OneSip 같은 단어가 번역되지 않게 placeholder로 바꾸고, 번역 후 다시 되돌릴 매핑 반환."""
     if not text:
         return text, {}
 
@@ -215,10 +203,7 @@ def _replace_brand_everywhere(soup: BeautifulSoup, old: str, new: str):
 
 
 def _remove_techpresso_header_footer_safely(soup: BeautifulSoup):
-    """
-    너무 큰 컨테이너를 날려서 본문이 사라지는 걸 줄이기 위해
-    '짧은 블록' 위주로만 제거.
-    """
+    """너무 큰 컨테이너를 날려서 본문이 사라지는 걸 줄이기 위해 '짧은 블록' 위주로만 제거."""
     candidates = soup.find_all(["header", "footer", "div", "section", "table", "tr", "td"])
     for tag in candidates:
         text = tag.get_text(" ", strip=True)
@@ -243,7 +228,7 @@ def _remove_blocks_containing_keywords_safely(soup: BeautifulSoup, keywords):
     """
     keywords가 포함된 블록을 삭제하되,
     table/tr/td를 바로 지우면 다른 섹션까지 같이 날아갈 수 있어서
-    기본은 div/section을 우선 삭제하고, table은 '작은' 경우에만 삭제.
+    기본은 div/section 우선, table은 '작은' 경우만.
     """
     for node in list(soup.find_all(string=True)):
         if not isinstance(node, str):
@@ -251,7 +236,7 @@ def _remove_blocks_containing_keywords_safely(soup: BeautifulSoup, keywords):
         if not _text_has_any(node, keywords):
             continue
 
-        # 1) div/section 우선 (가장 안전)
+        # 1) div/section 우선
         container = node.find_parent(["div", "section"])
         if container:
             txt = container.get_text(" ", strip=True)
@@ -259,7 +244,7 @@ def _remove_blocks_containing_keywords_safely(soup: BeautifulSoup, keywords):
                 container.decompose()
                 continue
 
-        # 2) 그래도 없으면 table(짧을 때만)
+        # 2) table(짧을 때만)
         table = node.find_parent("table")
         if table:
             txt = table.get_text(" ", strip=True)
@@ -267,7 +252,7 @@ def _remove_blocks_containing_keywords_safely(soup: BeautifulSoup, keywords):
                 table.decompose()
                 continue
 
-        # 3) 마지막 fallback: 해당 텍스트 노드 주변만 제거(과감한 삭제 방지)
+        # 3) fallback
         parent = node.parent
         if parent and parent.name in ("p", "h1", "h2", "h3", "h4", "td"):
             parent.decompose()
@@ -395,10 +380,7 @@ URL_RE = re.compile(r"(https?://\S+|www\.\S+)", re.IGNORECASE)
 
 
 def remove_visible_urls(soup: BeautifulSoup):
-    """
-    '텍스트로 노출된 URL'만 제거해서 PDF에 URL이 보이지 않게.
-    <a href="...">는 건드리지 않아서 링크는 유지됨.
-    """
+    """텍스트로 노출된 URL만 제거해서 PDF에 URL이 보이지 않게. <a href>는 유지."""
     for node in list(soup.find_all(string=True)):
         if not isinstance(node, NavigableString):
             continue
@@ -420,8 +402,10 @@ def remove_visible_urls(soup: BeautifulSoup):
 
 def translate_text_nodes_inplace(soup: BeautifulSoup):
     """
-    HTML 태그 구조는 그대로 유지하고, 텍스트 노드만 번역.
-    => <a href> 링크 유지 + URL은 번역/표시하지 않음
+    HTML 태그 구조는 그대로 유지하고 텍스트 노드만 번역.
+    - <a href> 링크 유지
+    - URL 텍스트는 표시/번역하지 않음
+    - ✅ bold/strong(도구명/고유명사 등)은 번역 제외
     """
     translated_nodes = 0
 
@@ -433,7 +417,7 @@ def translate_text_nodes_inplace(soup: BeautifulSoup):
         if parent in ("script", "style"):
             continue
 
-        # ✅ Trending tools 등에서 bold/strong(도구명/고유명사)은 번역 제외
+        # ✅ Trending tools bold 등은 번역 제외
         if parent in ("strong", "b"):
             continue
 
@@ -441,15 +425,15 @@ def translate_text_nodes_inplace(soup: BeautifulSoup):
         if not text.strip():
             continue
 
-        # URL이 텍스트로 들어있다면(혹시 남았으면) 번역 전에 제거
+        # URL이 텍스트로 들어있다면 제거
         if URL_RE.search(text):
             text = URL_RE.sub("", text)
 
-        # 영어 알파벳이 거의 없으면 스킵(숫자/기호/이미 한글 위주)
+        # 영어 알파벳이 거의 없으면 스킵
         if len(re.findall(r"[A-Za-z]", text)) < 2:
             continue
 
-        # 너무 긴 노드는 위험/비용 큼 → 스킵
+        # 너무 긴 노드는 비용/리스크 큼
         if len(text) > 2000:
             continue
 
@@ -529,7 +513,7 @@ def translate_html_preserve_layout(html: str, date_str: str) -> str:
 
 
 # ======================
-# PDF용 HTML 래핑 + CSS (잘림 방지/여백/한글 폰트)
+# PDF용 HTML 래핑 + CSS
 # ======================
 def wrap_html_for_pdf(inner_html: str) -> str:
     css = """
@@ -582,16 +566,10 @@ def wrap_html_for_pdf(inner_html: str) -> str:
 
 
 # ======================
-# RSS → 대상 날짜 HTML 추출 (ISSUE_OFFSET_DAYS)
+# RSS → 특정 날짜 HTML 추출
 # ======================
-def fetch_target_html():
+def fetch_issue_html(target_date_kst):
     feed = feedparser.parse(RSS_URL)
-
-    offset = get_issue_offset_days()  # 0, -1, -2 ...
-    target_date = now_kst().date() + timedelta(days=offset)
-
-    print("ISSUE_OFFSET_DAYS:", offset)
-    print("Target issue date (KST):", target_date)
 
     for e in feed.entries:
         if not hasattr(e, "published_parsed"):
@@ -600,7 +578,7 @@ def fetch_target_html():
         published_utc = datetime(*e.published_parsed[:6], tzinfo=timezone.utc)
         published_kst = published_utc.astimezone(KST).date()
 
-        if published_kst == target_date and "content" in e and e.content:
+        if published_kst == target_date_kst and "content" in e and e.content:
             return e.content[0].value
 
     return None
@@ -674,9 +652,11 @@ def send_email(pdf_path: str, date_str: str):
 def main():
     safe_print_deepl_usage("DeepL usage(before)")
 
-    date_str = now_kst().strftime("%Y-%m-%d")
+    target_date = now_kst().date() + timedelta(days=ISSUE_OFFSET_DAYS)
+    date_str = target_date.strftime("%Y-%m-%d")
+    print("Target issue date (KST):", date_str, "offset:", ISSUE_OFFSET_DAYS)
 
-    raw_html = fetch_target_html()
+    raw_html = fetch_issue_html(target_date)
     if not raw_html:
         print("No issue found for target date.")
         return
