@@ -3,7 +3,7 @@ import re
 import smtplib
 import ssl
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from email.message import EmailMessage
 
 import deepl
