@@ -8,7 +8,7 @@ from email.message import EmailMessage
 
 import deepl
 import feedparser
-from bs4 import BeautifulSoup, NavigableString
+from bs4 import BeautifulSoup, NavigableString, Tag
 from dateutil import tz
 from weasyprint import HTML
 
@@ -285,9 +285,9 @@ def _remove_blocks_containing_keywords_safely(soup: BeautifulSoup, keywords) -> 
 
 
 # ----------------------
-# ✅ 첫 번째 FROM OUR PARTNER 블록 제거 (가장 중요한 부분)
+# ✅ 첫 번째 FROM OUR PARTNER 블록 제거 (앵커 기반, 타입 A/B 모두 안전)
 # ----------------------
-_EMOJI_RE = re.compile(r"[\U0001F300-\U0001FAFF]")  # 🚀💥📈🖥️📚 등
+_EMOJI_RE = re.compile(r"[\U0001F300-\U0001FAFF]")
 
 
 def _find_first_emoji_string(soup: BeautifulSoup):
@@ -299,86 +299,141 @@ def _find_first_emoji_string(soup: BeautifulSoup):
     return None
 
 
-def _remove_first_partner_block_until_first_issue_table(soup: BeautifulSoup) -> int:
+def _find_partner_marker_tag(soup: BeautifulSoup) -> Tag | None:
     """
-    "첫 번째 FROM OUR PARTNER"가 등장하면,
-    그 다음 "첫 이모지(🚀 등)로 시작하는 첫 기사"가 들어있는 table 직전까지
-    '형제 노드'를 통째로 제거한다.
+    우선순위:
+    1) h4#main-ad-title (가장 정확)
+    2) id="main-ad-title" 어떤 태그든
+    3) 텍스트 "FROM OUR PARTNER" 포함 노드의 상위 h* / div
+    """
+    tag = soup.find(id="main-ad-title")
+    if isinstance(tag, Tag):
+        return tag
 
-    핵심 포인트:
-    - GitLab/IBM 등 광고 HTML 구조가 달라도, 기사 시작 table은 대부분 동일하게 존재
-    - 그래서 '첫 이모지 포함 td -> 그 td를 포함하는 table'을 경계로 삼으면 안정적
-    """
-    # 1) 첫 PARTNER 마커 찾기
-    marker_node = None
+    # fallback: text search
     for n in soup.find_all(string=True):
         if not isinstance(n, NavigableString):
             continue
         if "from our partner" in str(n).lower():
-            marker_node = n
-            break
-    if not marker_node:
+            h = n.find_parent(["h1", "h2", "h3", "h4", "h5", "h6"])
+            if h:
+                return h
+            d = n.find_parent(["div", "section"])
+            if d:
+                return d
+            return n.parent if isinstance(n.parent, Tag) else None
+
+    return None
+
+
+def _table_looks_like_issue(table: Tag) -> bool:
+    """
+    '기사 테이블' 판별 휴리스틱:
+    - 테이블 텍스트에 이모지가 있으면 거의 확정(OneSip 본문 특성)
+    - 아니면 padding-top: 50px 같은 기사 블록 스타일이 있으면 긍정
+    """
+    try:
+        txt = table.get_text(" ", strip=True)
+    except Exception:
+        txt = ""
+    if txt and _EMOJI_RE.search(txt):
+        return True
+
+    style = (table.get("style", "") or "").lower()
+    if "padding-top" in style and "50" in style:
+        return True
+
+    return False
+
+
+def _find_first_issue_table_after(marker_tag: Tag) -> Tag | None:
+    """
+    marker 이후 등장하는 table들 중,
+    1) 이모지 포함(또는 기사 스타일) table을 우선 반환
+    2) 없으면 marker 이후 첫 table 반환
+    """
+    first_table = None
+    for t in marker_tag.find_all_next("table"):
+        if first_table is None:
+            first_table = t
+        if _table_looks_like_issue(t):
+            return t
+    return first_table
+
+
+def _remove_first_partner_block_until_first_issue_table(soup: BeautifulSoup) -> int:
+    """
+    시작: main-ad-title(또는 FROM OUR PARTNER 마커)
+    끝: 그 다음 '첫 기사 테이블' 시작 직전까지
+
+    ✅ 테이블 자체는 삭제하지 않음(= 절대 첫 기사까지 안 잘림)
+    ✅ 타입 A/B 모두 대응
+    """
+    marker = _find_partner_marker_tag(soup)
+    if not marker:
         return 0
 
-    # 2) 첫 기사(이모지) 위치 찾기
-    emoji_node = _find_first_emoji_string(soup)
-    if not emoji_node:
-        return 0
-
-    issue_td = emoji_node.find_parent("td")
-    if not issue_td:
-        return 0
-
-    issue_table = issue_td.find_parent("table")
+    issue_table = _find_first_issue_table_after(marker)
     if not issue_table:
         return 0
 
-    # 3) issue_table의 이전 형제들을 거슬러 올라가며,
-    #    FROM OUR PARTNER를 포함하는 블록까지 전부 삭제
+    # marker에서 위로 올라가며 "광고 블록의 시작 컨테이너"를 잡는다.
+    # (보통 div/section 안에 묶여 있음)
+    start_block = marker
+    parent_div = marker.find_parent(["div", "section"])
+    if parent_div:
+        start_block = parent_div
+
     removed = 0
-    for sib in list(issue_table.previous_siblings):
-        # 공백 문자열/개행은 그냥 제거
-        if isinstance(sib, NavigableString):
-            if not str(sib).strip():
-                sib.extract()
-                continue
-            # 의미 있는 문자열인데 마커 포함이면 제거 후 종료
-            if "from our partner" in str(sib).lower():
-                sib.extract()
-                removed += 1
-                break
-            # 그 외 문자열도 제거(광고 잔여)
-            sib.extract()
-            removed += 1
-            continue
 
-        # Tag인 경우
+    # 1) start_block과 issue_table이 같은 parent 아래 있으면: 그 parent의 contents 기준으로 구간 제거
+    if start_block.parent is not None and issue_table.parent is not None and start_block.parent == issue_table.parent:
+        siblings = list(start_block.parent.contents)
         try:
-            txt = sib.get_text(" ", strip=True).lower()
-        except Exception:
-            txt = ""
+            i = siblings.index(start_block)
+            j = siblings.index(issue_table)
+        except ValueError:
+            i = j = -1
 
-        sib.decompose()
-        removed += 1
-
-        if "from our partner" in txt:
-            break
-
-    # 4) 혹시 남은 'FROM OUR PARTNER' 헤더(h*)/strong/b 제거(잔여 처리)
-    for n in list(soup.find_all(string=True)):
-        if not isinstance(n, NavigableString):
-            continue
-        if str(n).strip().upper() == "FROM OUR PARTNER":
-            h = n.find_parent(["h1", "h2", "h3", "h4", "h5", "h6"])
-            if h:
-                h.decompose()
+        if i != -1 and j != -1 and i < j:
+            for node in siblings[i:j]:
+                if isinstance(node, NavigableString) and not str(node).strip():
+                    node.extract()
+                    continue
+                try:
+                    node.decompose()
+                except Exception:
+                    try:
+                        node.extract()
+                    except Exception:
+                        pass
                 removed += 1
+            return removed
+
+    # 2) fallback: start_block부터 다음 형제들을 issue_table 직전까지 제거
+    cur = start_block
+    while cur is not None and cur != issue_table:
+        nxt = cur.next_sibling
+        # 공백 문자열은 제거만
+        if isinstance(cur, NavigableString):
+            if not str(cur).strip():
+                cur.extract()
             else:
-                b = n.find_parent(["b", "strong"])
-                if b:
-                    b.decompose()
+                cur.extract()
+                removed += 1
+        else:
+            try:
+                cur.decompose()
+                removed += 1
+            except Exception:
+                try:
+                    cur.extract()
                     removed += 1
+                except Exception:
+                    pass
+        if nxt is None:
             break
+        cur = nxt
 
     return removed
 
@@ -485,12 +540,12 @@ def translate_html_preserve_layout(html: str, date_str: str) -> str:
     # 0) 헤더/푸터 제거
     _remove_techpresso_header_footer_safely(soup)
 
-    # ✅ 0.5) 첫 번째 FROM OUR PARTNER 블록(광고)을 첫 기사 테이블 전까지 통째로 삭제
+    # ✅ 0.5) 첫 번째 FROM OUR PARTNER 블록(광고)을 "첫 기사 테이블 직전"까지 통째로 삭제
     removed_partner = _remove_first_partner_block_until_first_issue_table(soup)
     if removed_partner:
         print("Main partner block removed (until first issue table):", removed_partner)
 
-    # 1) 파트너 섹션 삭제(기타 파트너용)
+    # 1) 파트너 섹션 삭제(기타 파트너용, 잔여 처리)
     removed_partner2 = _remove_blocks_containing_keywords_safely(soup, PARTNER_KEYWORDS)
     if removed_partner2:
         print("Blocks removed by keywords (partner):", removed_partner2)
