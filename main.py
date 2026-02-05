@@ -36,6 +36,10 @@ PROTECT_TERMS = ["OneSip"]
 # 디버그: GitHub Actions에서 HTML/PDF를 아티팩트로 보고 싶으면 1
 DEBUG_DUMP_HTML = os.getenv("DEBUG_DUMP_HTML", "0") == "1"
 
+# ✅ 발행본 날짜 오프셋 (GitHub Variables로 제어)
+#  0: 오늘(KST 기준), -1: 어제, -2: 그제 ...
+ISSUE_OFFSET_DAYS_RAW = os.getenv("ISSUE_OFFSET_DAYS", "0").strip()
+
 KST = tz.gettz("Asia/Seoul")
 
 translator = None
@@ -48,6 +52,15 @@ if DEEPL_API_KEY:
 # ======================
 def now_kst():
     return datetime.now(tz=KST)
+
+
+def get_issue_offset_days() -> int:
+    raw = ISSUE_OFFSET_DAYS_RAW
+    try:
+        return int(raw)
+    except ValueError:
+        print("Invalid ISSUE_OFFSET_DAYS, using 0:", raw)
+        return 0
 
 
 def safe_print_deepl_usage(prefix="DeepL usage"):
@@ -497,11 +510,16 @@ def wrap_html_for_pdf(inner_html: str) -> str:
 
 
 # ======================
-# RSS → 오늘자 HTML 추출
+# RSS → 대상 날짜 HTML 추출 (ISSUE_OFFSET_DAYS)
 # ======================
-def fetch_today_html():
+def fetch_target_html():
     feed = feedparser.parse(RSS_URL)
-    today = now_kst().date()
+
+    offset = get_issue_offset_days()  # 0, -1, -2 ...
+    target_date = now_kst().date() + timedelta(days=offset)
+
+    print("ISSUE_OFFSET_DAYS:", offset)
+    print("Target issue date (KST):", target_date)
 
     for e in feed.entries:
         if not hasattr(e, "published_parsed"):
@@ -510,7 +528,7 @@ def fetch_today_html():
         published_utc = datetime(*e.published_parsed[:6], tzinfo=timezone.utc)
         published_kst = published_utc.astimezone(KST).date()
 
-        if published_kst == today and "content" in e and e.content:
+        if published_kst == target_date and "content" in e and e.content:
             return e.content[0].value
 
     return None
@@ -558,7 +576,11 @@ def send_email(pdf_path: str, date_str: str):
     msg["Subject"] = f"{MAIL_SUBJECT_PREFIX} ({date_str})"
     msg["From"] = mail_from
     msg["To"] = mail_to
-    msg.set_content(f"{MAIL_BODY_LINE}\n\n오늘의 Tech Issue를 OneSip으로 담았습니다.\n가볍게 읽어보시고 하루를 시작해보세요 ☕️")
+    msg.set_content(
+        f"{MAIL_BODY_LINE}\n\n"
+        "오늘의 Tech Issue를 OneSip으로 담았습니다.\n"
+        "가볍게 읽어보시고 하루를 시작해보세요 ☕️"
+    )
 
     with open(pdf_path, "rb") as f:
         msg.add_attachment(
@@ -582,9 +604,9 @@ def main():
 
     date_str = now_kst().strftime("%Y-%m-%d")
 
-    raw_html = fetch_today_html()
+    raw_html = fetch_target_html()
     if not raw_html:
-        print("No issue found today.")
+        print("No issue found for target date.")
         return
 
     translated_inner_html = translate_html_preserve_layout(raw_html, date_str)
