@@ -264,6 +264,55 @@ def _remove_blocks_containing_keywords_safely(soup: BeautifulSoup, keywords):
             parent.decompose()
 
 
+def _remove_first_partner_main_ad(soup: BeautifulSoup) -> int:
+    """
+    첫 번째 FROM OUR PARTNER (main-ad-* GitLab 광고 블록)만 정확히 제거.
+    RSS에서 확인된 id 패턴:
+      - main-ad-headline, main-ad-image-link, main-ad-image, main-ad-copy
+    """
+    main_ad_nodes = []
+    for _id in ("main-ad-headline", "main-ad-image-link", "main-ad-image", "main-ad-copy"):
+        n = soup.find(id=_id)
+        if n:
+            main_ad_nodes.append(n)
+
+    if not main_ad_nodes:
+        return 0
+
+    removed = 0
+
+    # main-ad 구성 요소 제거
+    for _id in ("main-ad-copy", "main-ad-image-link", "main-ad-headline", "main-ad-image"):
+        n = soup.find(id=_id)
+        if n:
+            n.decompose()
+            removed += 1
+
+    # 'FROM OUR PARTNER' 헤더도 같이 제거(앞부분에 붙는 경우)
+    for s in list(soup.find_all(string=True)):
+        t = re.sub(r"\s+", " ", str(s)).strip().upper()
+        if t == "FROM OUR PARTNER":
+            header = s.find_parent(["h1", "h2", "h3", "h4", "h5", "h6"])
+            if header:
+                header.decompose()
+                removed += 1
+            else:
+                btag = s.find_parent(["b", "strong"])
+                if btag:
+                    btag.decompose()
+                    removed += 1
+            break
+
+    # 잔여 br 정리(선택)
+    for br in soup.find_all("br")[:4]:
+        prev_txt = br.previous_sibling or ""
+        next_txt = br.next_sibling or ""
+        if (not str(prev_txt).strip()) and (not str(next_txt).strip()):
+            br.decompose()
+
+    return removed
+
+
 # ----------------------
 # URL 표시 제거 + 링크 유지 번역
 # ----------------------
@@ -287,7 +336,6 @@ def remove_visible_urls(soup: BeautifulSoup):
         if not txt.strip():
             continue
 
-        # URL이 텍스트로 노출된 경우만 제거
         if URL_RE.search(txt):
             cleaned = URL_RE.sub("", txt)
             cleaned = re.sub(r"\(\s*\)", "", cleaned)  # 빈 괄호 제거
@@ -308,6 +356,10 @@ def translate_text_nodes_inplace(soup: BeautifulSoup):
 
         parent = node.parent.name if node.parent else ""
         if parent in ("script", "style"):
+            continue
+
+        # ✅ Trending tools 등에서 bold/strong(도구명/고유명사)은 번역 제외
+        if parent in ("strong", "b"):
             continue
 
         text = str(node)
@@ -342,7 +394,12 @@ def translate_html_preserve_layout(html: str, date_str: str) -> str:
     # 0) 헤더/푸터 제거
     _remove_techpresso_header_footer_safely(soup)
 
-    # 1) 파트너 섹션 삭제
+    # 0.5) 첫 번째 FROM OUR PARTNER(main-ad GitLab) 패턴 제거
+    removed_main_ad = _remove_first_partner_main_ad(soup)
+    if removed_main_ad:
+        print("Main partner ad removed (main-ad-*):", removed_main_ad)
+
+    # 1) 파트너 섹션 삭제(기타 파트너용)
     _remove_blocks_containing_keywords_safely(soup, PARTNER_KEYWORDS)
 
     # 2) AI Academy 섹션 삭제
@@ -369,6 +426,7 @@ def translate_html_preserve_layout(html: str, date_str: str) -> str:
         print("WARNING: HTML too small after cleanup. Falling back without header/footer removal.")
         soup2 = BeautifulSoup(html, "html.parser")
 
+        _remove_first_partner_main_ad(soup2)
         _remove_blocks_containing_keywords_safely(soup2, PARTNER_KEYWORDS)
         _remove_blocks_containing_keywords_safely(soup2, REMOVE_SECTION_KEYWORDS)
 
