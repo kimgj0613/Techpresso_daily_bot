@@ -1,16 +1,16 @@
 import os
 import re
+import smtplib
+import ssl
 import time
-import feedparser
 from datetime import datetime, timezone
-from dateutil import tz
-from bs4 import BeautifulSoup
-from bs4 import NavigableString
-from bs4.element import Tag
-from weasyprint import HTML
-import smtplib, ssl
 from email.message import EmailMessage
+
 import deepl
+import feedparser
+from bs4 import BeautifulSoup, NavigableString
+from dateutil import tz
+from weasyprint import HTML
 
 
 # ======================
@@ -103,8 +103,10 @@ def _split_by_paragraph(text: str, max_chars: int = 4500):
     text = (text or "").strip()
     if not text:
         return []
+
     paras = [p.strip() for p in re.split(r"\n{2,}", text) if p.strip()]
     chunks, buf = [], ""
+
     for p in paras:
         add = p + "\n\n"
         if len(buf) + len(add) <= max_chars:
@@ -112,6 +114,7 @@ def _split_by_paragraph(text: str, max_chars: int = 4500):
         else:
             if buf.strip():
                 chunks.append(buf.strip())
+
             if len(add) > max_chars:
                 for i in range(0, len(add), max_chars):
                     part = add[i : i + max_chars].strip()
@@ -120,8 +123,10 @@ def _split_by_paragraph(text: str, max_chars: int = 4500):
                 buf = ""
             else:
                 buf = add
+
     if buf.strip():
         chunks.append(buf.strip())
+
     return chunks
 
 
@@ -210,151 +215,19 @@ def _remove_techpresso_header_footer_safely(soup: BeautifulSoup):
         text = tag.get_text(" ", strip=True)
         if not text:
             continue
+
         kw = _match_keyword_count(text, REMOVE_KEYWORDS_HEADER_FOOTER)
         if kw == 0:
             continue
+
         if len(text) > 1600:
             continue
+
         if tag.name in ["div", "section", "table", "tr", "td"]:
             if kw >= 2:
                 tag.decompose()
         else:
             tag.decompose()
-
-
-
-def _remove_partner_sections_only(soup: BeautifulSoup):
-    """
-    'FROM OUR PARTNER' 섹션을 통째로 제거.
-    - 'FROM OUR PARTNER' 텍스트 노드를 찾는다(대소문자/공백 변형 허용)
-    - 우선 가장 가까운 table을 제거(파트너 블록은 대부분 table 래핑)
-    - table이 너무 크면(tr/td/div/section/table 중) 가장 작은 컨테이너를 제거
-    """
-    removed = 0
-
-    def _smallest_container(from_node, names=("td","tr","div","section","table"), min_len=200, max_len=30000):
-        candidates = []
-        for n in names:
-            anc = from_node.find_parent(n)
-            if not anc:
-                continue
-            txt = anc.get_text(" ", strip=True)
-            if not txt:
-                continue
-            l = len(txt)
-            if l < min_len or l > max_len:
-                continue
-            candidates.append((l, anc))
-        if not candidates:
-            return None
-        candidates.sort(key=lambda x: x[0])
-        return candidates[0][1]
-
-    while True:
-        hit = None
-        for node in list(soup.find_all(string=True)):
-            t = re.sub(r"\s+", " ", str(node)).strip().upper()
-            if t == "FROM OUR PARTNER":
-                hit = node
-                break
-        if hit is None:
-            break
-
-        table = hit.find_parent("table")
-        if table:
-            tlen = len(table.get_text(" ", strip=True))
-            if 500 < tlen < 30000:
-                table.decompose()
-                removed += 1
-                continue
-
-        target = _smallest_container(hit)
-        if target:
-            target.decompose()
-            removed += 1
-            continue
-
-        parent = getattr(hit, "parent", None)
-        if getattr(parent, "decompose", None):
-            parent.decompose()
-            removed += 1
-        else:
-            break
-
-    print("Partner blocks removed:", removed)
-
-
-def _remove_header_footer_by_markers(soup: BeautifulSoup):
-    """
-    헤더/푸터를 '대표 문구' 기반으로 제거 (NavigableString 안전 처리 버전)
-    - 텍스트 노드에서 직접 find_parent를 호출하지 않고
-      항상 parent(Tag)에서 탐색을 시작한다.
-    """
-    header_markers = [
-        "join free",
-        "upgrade",
-        "together with",
-        "hi there, this is your daily",
-        "in today's techpresso",
-    ]
-    footer_markers = [
-        "not subscribed to",
-        "subscribe for free",
-        "advertise",
-        "feedback",
-        "read online",
-    ]
-
-    def _hit(text, markers):
-        t = (text or "").lower()
-        return any(m in t for m in markers)
-
-    removed_header = 0
-    removed_footer = 0
-
-    for node in list(soup.find_all(string=True)):
-        txt = re.sub(r"\s+", " ", str(node)).strip()
-        if not txt:
-            continue
-
-        is_header = _hit(txt, header_markers)
-        is_footer = _hit(txt, footer_markers)
-        if not (is_header or is_footer):
-            continue
-
-        # ✅ 핵심: parent(Tag)에서부터만 올라가기
-        parent = getattr(node, "parent", None)
-        if parent is None or not getattr(parent, "find_parent", None):
-            continue
-
-        candidates = []
-        for name in ("tr", "td", "table", "div", "section"):
-            anc = parent if getattr(parent, "name", None) == name else parent.find_parent(name)
-            if not anc:
-                continue
-            a_txt = anc.get_text(" ", strip=True)
-            if not a_txt:
-                continue
-            l = len(a_txt)
-            # 너무 큰 wrapper는 피함
-            if 80 < l < 30000:
-                candidates.append((l, anc))
-
-        if not candidates:
-            continue
-
-        candidates.sort(key=lambda x: x[0])
-        candidates[0][1].decompose()
-        if is_header:
-            removed_header += 1
-        if is_footer:
-            removed_footer += 1
-
-    if removed_header:
-        print("Header blocks removed (marker-based):", removed_header)
-    if removed_footer:
-        print("Footer blocks removed (marker-based):", removed_footer)
-
 
 
 def _remove_blocks_containing_keywords_safely(soup: BeautifulSoup, keywords):
@@ -405,12 +278,9 @@ def remove_visible_urls(soup: BeautifulSoup):
     for node in list(soup.find_all(string=True)):
         if not isinstance(node, NavigableString):
             continue
-        parent_name = node.parent.name if node.parent else ""
-        if parent_name in ("script", "style"):
-            continue
 
-        # ✅ bold/strong 텍스트(도구명/고유명사)는 번역 제외
-        if parent_name in ("strong", "b"):
+        parent = node.parent.name if node.parent else ""
+        if parent in ("script", "style"):
             continue
 
         txt = str(node)
@@ -420,7 +290,7 @@ def remove_visible_urls(soup: BeautifulSoup):
         # URL이 텍스트로 노출된 경우만 제거
         if URL_RE.search(txt):
             cleaned = URL_RE.sub("", txt)
-            cleaned = re.sub(r"\(\s*\)", "", cleaned)      # 빈 괄호 제거
+            cleaned = re.sub(r"\(\s*\)", "", cleaned)  # 빈 괄호 제거
             cleaned = re.sub(r"\s{2,}", " ", cleaned).strip()
             node.replace_with(cleaned)
 
@@ -436,12 +306,8 @@ def translate_text_nodes_inplace(soup: BeautifulSoup):
         if not isinstance(node, NavigableString):
             continue
 
-        parent_name = node.parent.name if node.parent else ""
-        if parent_name in ("script", "style"):
-            continue
-
-        # ✅ bold/strong 텍스트(도구명/고유명사)는 번역 제외
-        if parent_name in ("strong", "b"):
+        parent = node.parent.name if node.parent else ""
+        if parent in ("script", "style"):
             continue
 
         text = str(node)
@@ -475,10 +341,9 @@ def translate_html_preserve_layout(html: str, date_str: str) -> str:
 
     # 0) 헤더/푸터 제거
     _remove_techpresso_header_footer_safely(soup)
-    _remove_header_footer_by_markers(soup)
 
-    # 1) 파트너 섹션 삭제 (FROM OUR PARTNER만 강력 제거)
-    _remove_partner_sections_only(soup)
+    # 1) 파트너 섹션 삭제
+    _remove_blocks_containing_keywords_safely(soup, PARTNER_KEYWORDS)
 
     # 2) AI Academy 섹션 삭제
     _remove_blocks_containing_keywords_safely(soup, REMOVE_SECTION_KEYWORDS)
@@ -622,12 +487,16 @@ def send_email(pdf_path: str, date_str: str):
     mail_from = os.getenv("MAIL_FROM")
     mail_to = os.getenv("MAIL_TO")
 
-    missing = [k for k, v in {
-        "SMTP_USER": smtp_user,
-        "SMTP_PASS": smtp_pass,
-        "MAIL_FROM": mail_from,
-        "MAIL_TO": mail_to,
-    }.items() if not v]
+    missing = [
+        k
+        for k, v in {
+            "SMTP_USER": smtp_user,
+            "SMTP_PASS": smtp_pass,
+            "MAIL_FROM": mail_from,
+            "MAIL_TO": mail_to,
+        }.items()
+        if not v
+    ]
     if missing:
         raise ValueError(f"이메일 설정 환경변수가 비었습니다: {', '.join(missing)}")
 
@@ -670,8 +539,11 @@ def main():
 
     translated_inner_html = translate_html_preserve_layout(raw_html, date_str)
 
-    final_text_len = len(BeautifulSoup(translated_inner_html, "html.parser").get_text(" ", strip=True))
+    final_text_len = len(
+        BeautifulSoup(translated_inner_html, "html.parser").get_text(" ", strip=True)
+    )
     print("Final HTML text length:", final_text_len)
+
     if final_text_len < 200:
         raise RuntimeError("Final HTML seems empty. Aborting to avoid blank PDF.")
 
