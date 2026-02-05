@@ -50,10 +50,6 @@ def now_kst():
     return datetime.now(tz=KST)
 
 
-def is_sunday_kst():
-    return now_kst().weekday() == 6
-
-
 def safe_print_deepl_usage(prefix="DeepL usage"):
     if not translator:
         return
@@ -562,7 +558,7 @@ def send_email(pdf_path: str, date_str: str):
     msg["Subject"] = f"{MAIL_SUBJECT_PREFIX} ({date_str})"
     msg["From"] = mail_from
     msg["To"] = mail_to
-    msg.set_content(f"{MAIL_BODY_LINE}\n\n오늘의 한글 번역본을 첨부합니다.")
+    msg.set_content(f"{MAIL_BODY_LINE}\n\n오늘의 Tech Issue를 OneSip으로 담았습니다.\n가볍게 읽어보시고 하루를 시작해보세요 ☕️")
 
     with open(pdf_path, "rb") as f:
         msg.add_attachment(
@@ -582,10 +578,6 @@ def send_email(pdf_path: str, date_str: str):
 # 메인
 # ======================
 def main():
-    if is_sunday_kst():
-        print("Sunday – skipped")
-        return
-
     safe_print_deepl_usage("DeepL usage(before)")
 
     date_str = now_kst().strftime("%Y-%m-%d")
