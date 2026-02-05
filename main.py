@@ -225,11 +225,33 @@ def _remove_techpresso_header_footer_safely(soup: BeautifulSoup):
             tag.decompose()
 
 
+def _container_has_issue_content(tag: Tag) -> bool:
+    """
+    이 컨테이너 안에 '기사 본문'이 들어있으면 True.
+    - 이모지(🚀💥 등) 포함 텍스트가 있거나
+    - 기사 테이블로 보이는 table이 있으면 True
+    """
+    try:
+        txt = tag.get_text(" ", strip=True)
+        if txt and _EMOJI_RE.search(txt):
+            return True
+    except Exception:
+        pass
+
+    try:
+        for t in tag.find_all("table"):
+            if _table_looks_like_issue(t):
+                return True
+    except Exception:
+        pass
+
+    return False
+
+
 def _remove_blocks_containing_keywords_safely(soup: BeautifulSoup, keywords) -> int:
     """
-    keyword가 포함된 블록 삭제(안전 버전)
-    - NavigableString(=BeautifulSoup 노드)만 대상으로 하고
-    - node.find_parent 같은 내부 헬퍼에 의존하지 않아 에러를 피함
+    keyword가 포함된 블록 삭제(안전 강화 버전)
+    ✅ 단, '기사 컨텐츠(이모지/기사 테이블)'가 포함된 큰 컨테이너는 절대 삭제하지 않음
     """
     removed = 0
 
@@ -253,13 +275,18 @@ def _remove_blocks_containing_keywords_safely(soup: BeautifulSoup, keywords) -> 
             cur = cur.parent
 
         if container:
+            # ✅ 기사 내용이 섞여 있으면 삭제 금지
+            if _container_has_issue_content(container):
+                continue
+
             txt = container.get_text(" ", strip=True)
-            if txt and len(txt) <= 6000:
+            # 너무 큰 블록은 위험 -> 삭제 금지(기준 더 빡세게)
+            if txt and len(txt) <= 2500:
                 container.decompose()
                 removed += 1
                 continue
 
-        # 2) table(짧을 때만)
+        # 2) table(짧을 때만) — table 자체가 기사면 삭제 금지
         cur = node.parent
         table = None
         while cur is not None:
@@ -269,19 +296,31 @@ def _remove_blocks_containing_keywords_safely(soup: BeautifulSoup, keywords) -> 
             cur = cur.parent
 
         if table:
+            if _table_looks_like_issue(table):
+                continue
+
             txt = table.get_text(" ", strip=True)
-            if txt and len(txt) <= 3500:
+            if txt and len(txt) <= 1800:
                 table.decompose()
                 removed += 1
                 continue
 
-        # 3) fallback: p/h*/td 정도만 제거
+        # 3) fallback: p/h*/td 정도만 제거(기사 td면 삭제 금지)
         parent = node.parent
         if parent and getattr(parent, "name", None) in ("p", "h1", "h2", "h3", "h4", "td"):
+            # td가 기사(이모지 포함)면 삭제 금지
+            try:
+                ptxt = parent.get_text(" ", strip=True)
+                if ptxt and _EMOJI_RE.search(ptxt):
+                    continue
+            except Exception:
+                pass
+
             parent.decompose()
             removed += 1
 
     return removed
+
 
 
 # ----------------------
@@ -558,9 +597,16 @@ def translate_html_preserve_layout(html: str, date_str: str) -> str:
     if removed_ai:
         print("Blocks removed by keywords (ai-academy):", removed_ai)
 
+    # ✅ DEBUG: 키워드 제거 직후 본문 길이 확인
+    print(
+        "After keyword removals text length:",
+        len(BeautifulSoup(str(soup), "html.parser").get_text(" ", strip=True)),
+    )
+
     # 3) 광고 제거
     for ad in soup.select("[data-testid='ad'], .sponsor, .advertisement"):
         ad.decompose()
+
 
     # 4) 브랜딩 치환 (Techpresso -> OneSip)
     _replace_brand_everywhere(soup, BRAND_FROM, BRAND_TO)
@@ -601,7 +647,14 @@ def translate_html_preserve_layout(html: str, date_str: str) -> str:
             f.write(out_html)
         print("Wrote debug inner HTML:", f"debug_onesip_inner_{date_str}.html")
 
+    # ✅ DEBUG: 최종 반환 직전 길이 확인
+    print(
+        "Before return text length:",
+        len(BeautifulSoup(out_html, "html.parser").get_text(" ", strip=True)),
+    )
+
     return out_html
+
 
 
 # ======================
