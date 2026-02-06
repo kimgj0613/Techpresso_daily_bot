@@ -56,7 +56,7 @@ jobs:
           SMTP_USER: ${{ secrets.SMTP_USER }}
           SMTP_PASS: ${{ secrets.SMTP_PASS }}
           MAIL_FROM: ${{ secrets.MAIL_FROM }}
-          MAIL_TO: ${{ secrets.MAIL_TO }}
+          MAIL_TO: ${{ vars.MAIL_TO }}
 
           # GitHub Variables로 관리 (기본 0)
           DEBUG_DUMP_HTML: ${{ vars.DEBUG_DUMP_HTML }}
