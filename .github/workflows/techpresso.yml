@@ -7,9 +7,6 @@ on:
     - cron: "30 23 * * 1-6"
   workflow_dispatch:
 
-permissions:
-  contents: write
-
 jobs:
   build-and-send:
     runs-on: ubuntu-latest
@@ -17,8 +14,6 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -67,21 +62,9 @@ jobs:
           DEBUG_DUMP_HTML: ${{ vars.DEBUG_DUMP_HTML }}
           ISSUE_OFFSET_DAYS: ${{ vars.ISSUE_OFFSET_DAYS }}
 
-          # ✅ 2달(기본 62일) 보관
-          KEEP_DAYS: ${{ vars.KEEP_DAYS }}
 
         run: |
           python main.py
-
-      # ✅ Daily JSON(data/daily) 저장분을 repo에 커밋/푸시 (삭제(prune)도 반영)
-      - name: Commit daily data (keep last 2 months)
-        run: |
-          git pull --rebase
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add -A data/daily || true
-          git commit -m "chore: update daily onesip data" || echo "No changes to commit"
-          git push
 
       # ✅ 성공/실패 관계없이 결과물 확인 가능
       - name: Upload artifacts (pdf/html)
