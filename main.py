@@ -1,8 +1,10 @@
 import os
 import re
+import json
 import smtplib
 import ssl
 import time
+from pathlib import Path
 from datetime import datetime, timedelta, timezone
 from email.message import EmailMessage
 
@@ -45,12 +47,47 @@ translator = None
 if DEEPL_API_KEY:
     translator = deepl.Translator(DEEPL_API_KEY, server_url=DEEPL_SERVER_URL)
 
+# ✅ Daily JSON storage (English raw only)
+DATA_DIR = Path(os.getenv("DATA_DIR", "data/daily"))
+KEEP_DAYS = int(os.getenv("KEEP_DAYS", "62"))  # 약 2달
+
 
 # ======================
 # 유틸
 # ======================
 def now_kst():
     return datetime.now(tz=KST)
+
+
+def _ensure_dir(p: Path):
+    p.mkdir(parents=True, exist_ok=True)
+
+
+def prune_daily_data(keep_days: int = 62):
+    """data/daily 안에서 keep_days보다 오래된 YYYY-MM-DD.json 삭제"""
+    _ensure_dir(DATA_DIR)
+    cutoff = now_kst().date() - timedelta(days=keep_days)
+
+    removed = 0
+    for fp in DATA_DIR.glob("*.json"):
+        try:
+            d = datetime.strptime(fp.stem, "%Y-%m-%d").date()
+        except Exception:
+            continue
+        if d < cutoff:
+            fp.unlink(missing_ok=True)
+            removed += 1
+
+    if removed:
+        print(f"Pruned old daily json files: {removed} (keep_days={keep_days})")
+
+
+def save_daily_json(date_str: str, payload: dict):
+    _ensure_dir(DATA_DIR)
+    fp = DATA_DIR / f"{date_str}.json"
+    with open(fp, "w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False, indent=2)
+    print("Saved daily json:", str(fp))
 
 
 def safe_print_deepl_usage(prefix="DeepL usage"):
@@ -398,14 +435,9 @@ def _remove_ai_academy_block_by_link(soup: BeautifulSoup) -> int:
 
 
 # ----------------------
-# ✅ Partner 블록 제거 (1) Main: 첫 FROM OUR PARTNER를 첫 기사 테이블 직전까지
+# ✅ Partner 블록 제거 (기존 로직 유지)
 # ----------------------
 def _find_partner_marker_tag(soup: BeautifulSoup) -> Tag | None:
-    """
-    우선순위:
-    1) id="main-ad-title"
-    2) 텍스트 "FROM OUR PARTNER" 포함 노드의 상위 h* / div
-    """
     tag = soup.find(id="main-ad-title")
     if isinstance(tag, Tag):
         return tag
@@ -436,13 +468,6 @@ def _find_first_issue_table_after(marker_tag: Tag) -> Tag | None:
 
 
 def _remove_first_partner_block_until_first_issue_table(soup: BeautifulSoup) -> int:
-    """
-    시작: main-ad-title(또는 FROM OUR PARTNER 마커)
-    끝: 그 다음 '첫 기사 테이블' 시작 직전까지
-
-    ✅ 공통 부모(LCA) 내부에서 "형제 구간"만 제거해서
-       광고 블록 부모 div가 이메일 전체를 감싸더라도 본문이 통째로 삭제되지 않음.
-    """
     marker = _find_partner_marker_tag(soup)
     if not marker:
         return 0
@@ -451,7 +476,6 @@ def _remove_first_partner_block_until_first_issue_table(soup: BeautifulSoup) -> 
     if not issue_table:
         return 0
 
-    # 1) issue_table 기준으로 위로 올라가며 marker를 포함하는 "공통 부모" 찾기
     common_parent = issue_table
     while common_parent is not None:
         try:
@@ -464,17 +488,14 @@ def _remove_first_partner_block_until_first_issue_table(soup: BeautifulSoup) -> 
     if common_parent is None:
         return 0
 
-    # 2) common_parent 바로 아래 레벨에서 marker를 포함하는 direct child(start_child) 찾기
     start_child = marker
     while start_child.parent is not None and start_child.parent != common_parent:
         start_child = start_child.parent
 
-    # 3) common_parent 바로 아래 레벨에서 issue_table을 포함하는 direct child(end_child) 찾기
     end_child = issue_table
     while end_child.parent is not None and end_child.parent != common_parent:
         end_child = end_child.parent
 
-    # 4) common_parent.contents에서 start_child ~ end_child 직전까지 삭제
     removed = 0
     siblings = list(common_parent.contents)
 
@@ -489,11 +510,8 @@ def _remove_first_partner_block_until_first_issue_table(soup: BeautifulSoup) -> 
 
     for node in siblings[i:j]:
         if isinstance(node, NavigableString):
-            if str(node).strip() == "":
-                node.extract()
-            else:
-                node.extract()
-                removed += 1
+            node.extract()
+            removed += 1
             continue
 
         try:
@@ -508,15 +526,7 @@ def _remove_first_partner_block_until_first_issue_table(soup: BeautifulSoup) -> 
     return removed
 
 
-# ----------------------
-# ✅ Partner 블록 제거 (2) Spotlight: 두 번째 FROM OUR PARTNER
-# ----------------------
 def _remove_spotlight_partner_block(soup: BeautifulSoup) -> int:
-    """
-    두 번째 FROM OUR PARTNER(spotlight) 광고 블록 제거
-    - id="spotlight-ad-block" / id="spotlight-ad-title" 기반
-    - 가능하면 tr 단위로 제거해서 레이아웃 깨짐 최소화
-    """
     removed = 0
 
     block = soup.find(id="spotlight-ad-block")
@@ -540,9 +550,6 @@ def _remove_spotlight_partner_block(soup: BeautifulSoup) -> int:
     return removed
 
 
-# ----------------------
-# ✅ Partner 블록 제거 (3) 미래 대비: FROM OUR PARTNER가 3번 이상 생겨도 반복 제거
-# ----------------------
 def _find_next_partner_text_node(soup: BeautifulSoup) -> NavigableString | None:
     for n in soup.find_all(string=True):
         if not isinstance(n, NavigableString):
@@ -553,31 +560,21 @@ def _find_next_partner_text_node(soup: BeautifulSoup) -> NavigableString | None:
 
 
 def _remove_partner_block_around_text_node(n: NavigableString) -> bool:
-    """
-    'FROM OUR PARTNER' 텍스트 노드 주변의 광고 블록만 제거(기사 영역 보호).
-    제거 우선순위:
-    1) tr
-    2) table (단, 기사 테이블이면 제거 금지)
-    3) div/section (단, 기사 컨텐츠 섞이면 제거 금지)
-    """
     if not n or not n.parent:
         return False
 
-    # 1) tr 우선
     tr = n.find_parent("tr")
     if isinstance(tr, Tag):
         if not _container_has_issue_content(tr):
             tr.decompose()
             return True
 
-    # 2) table
     table = n.find_parent("table")
     if isinstance(table, Tag):
         if not _table_looks_like_issue(table) and not _container_has_issue_content(table):
             table.decompose()
             return True
 
-    # 3) div/section
     container = n.find_parent(["div", "section"])
     if isinstance(container, Tag):
         if not _container_has_issue_content(container):
@@ -586,7 +583,6 @@ def _remove_partner_block_around_text_node(n: NavigableString) -> bool:
                 container.decompose()
                 return True
 
-    # 4) fallback: h태그/td/p 정도만
     parent = n.find_parent(["h1", "h2", "h3", "h4", "p", "td"])
     if isinstance(parent, Tag):
         try:
@@ -618,6 +614,20 @@ def _remove_partner_blocks_until_limit(soup: BeautifulSoup, max_blocks: int = 5)
     return removed
 
 
+def _remove_partner_everything(soup: BeautifulSoup) -> None:
+    removed_main = _remove_first_partner_block_until_first_issue_table(soup)
+    if removed_main:
+        print("Main partner block removed (until first issue table):", removed_main)
+
+    removed_spot = _remove_spotlight_partner_block(soup)
+    if removed_spot:
+        print("Spotlight partner block removed:", removed_spot)
+
+    removed_rest = _remove_partner_blocks_until_limit(soup, max_blocks=5)
+    if removed_rest:
+        print("Extra partner blocks removed:", removed_rest)
+
+
 # ----------------------
 # 첫 기사 정렬 보정
 # ----------------------
@@ -631,10 +641,6 @@ def _find_first_emoji_string(soup: BeautifulSoup):
 
 
 def _ensure_first_issue_left_align(soup: BeautifulSoup):
-    """
-    파트너 블록 제거 후 첫 기사 제목이 가운데로 밀리는 현상 방지:
-    첫 이모지 포함 td에 text-align:left 강제 부여.
-    """
     emoji_node = _find_first_emoji_string(soup)
     if not emoji_node:
         return
@@ -658,10 +664,6 @@ URL_RE = re.compile(r"(https?://\S+|www\.\S+)", re.IGNORECASE)
 
 
 def remove_visible_urls(soup: BeautifulSoup):
-    """
-    '텍스트로 노출된 URL'만 제거해서 PDF에 URL이 보이지 않게.
-    <a href="...">는 건드리지 않아서 링크는 유지됨.
-    """
     for node in list(soup.find_all(string=True)):
         if not isinstance(node, NavigableString):
             continue
@@ -676,16 +678,12 @@ def remove_visible_urls(soup: BeautifulSoup):
 
         if URL_RE.search(txt):
             cleaned = URL_RE.sub("", txt)
-            cleaned = re.sub(r"\(\s*\)", "", cleaned)  # 빈 괄호 제거
+            cleaned = re.sub(r"\(\s*\)", "", cleaned)
             cleaned = re.sub(r"\s{2,}", " ", cleaned).strip()
             node.replace_with(cleaned)
 
 
 def translate_text_nodes_inplace(soup: BeautifulSoup):
-    """
-    HTML 태그 구조는 그대로 유지하고, 텍스트 노드만 번역.
-    => <a href> 링크 유지 + URL은 번역/표시하지 않음
-    """
     translated_nodes = 0
 
     for node in list(soup.find_all(string=True)):
@@ -696,7 +694,6 @@ def translate_text_nodes_inplace(soup: BeautifulSoup):
         if parent in ("script", "style"):
             continue
 
-        # ✅ Trending tools 등에서 bold/strong(도구명/고유명사)은 번역 제외
         if parent in ("strong", "b"):
             continue
 
@@ -704,15 +701,12 @@ def translate_text_nodes_inplace(soup: BeautifulSoup):
         if not text.strip():
             continue
 
-        # URL이 텍스트로 들어있다면(혹시 남았으면) 번역 전에 제거
         if URL_RE.search(text):
             text = URL_RE.sub("", text)
 
-        # 영어 알파벳이 거의 없으면 스킵
         if len(re.findall(r"[A-Za-z]", text)) < 2:
             continue
 
-        # 너무 긴 노드는 위험/비용 큼 → 스킵
         if len(text) > 2000:
             continue
 
@@ -726,104 +720,49 @@ def translate_text_nodes_inplace(soup: BeautifulSoup):
     print("Translated text nodes:", translated_nodes)
 
 
-def _remove_partner_everything(soup: BeautifulSoup) -> None:
-    """
-    partner 제거를 한 번에 묶어서 실행 (정상 루트/fallback 루트 공통)
-    순서가 중요:
-    1) main partner(첫 블록) 제거
-    2) spotlight(id 기반) 제거
-    3) 남아있는 FROM OUR PARTNER 반복 제거(미래 대비)
-    """
-    removed_main = _remove_first_partner_block_until_first_issue_table(soup)
-    if removed_main:
-        print("Main partner block removed (until first issue table):", removed_main)
-
-    removed_spot = _remove_spotlight_partner_block(soup)
-    if removed_spot:
-        print("Spotlight partner block removed:", removed_spot)
-
-    removed_rest = _remove_partner_blocks_until_limit(soup, max_blocks=5)
-    if removed_rest:
-        print("Extra partner blocks removed:", removed_rest)
-
-
 def translate_html_preserve_layout(html: str, date_str: str) -> str:
     soup = BeautifulSoup(html, "html.parser")
 
-    # 0) 헤더/푸터 제거
     _remove_techpresso_header_footer_safely(soup)
-
-    # ✅ Partner 전체 제거(1~N)
     _remove_partner_everything(soup)
 
-    print(
-        "After partner removal text length:",
-        len(BeautifulSoup(str(soup), "html.parser").get_text(" ", strip=True)),
-    )
-
-    # ✅ AI Academy(🎓) 링크 기반 제거 (가장 정확하고 안전)
     removed_academy = _remove_ai_academy_block_by_link(soup)
     if removed_academy:
         print("AI Academy block removed by link:", removed_academy)
 
-    # 1) 파트너 키워드 잔여 처리(아주 보수적으로)
     removed_partner2 = _remove_blocks_containing_keywords_safely(soup, PARTNER_KEYWORDS)
     if removed_partner2:
         print("Blocks removed by keywords (partner):", removed_partner2)
 
-    # 2) AI Academy 섹션 삭제(키워드 기반 보조)
     removed_ai = _remove_blocks_containing_keywords_safely(soup, REMOVE_SECTION_KEYWORDS)
     if removed_ai:
         print("Blocks removed by keywords (ai-academy):", removed_ai)
 
-    # ✅ DEBUG: 키워드 제거 직후 본문 길이 확인
-    print(
-        "After keyword removals text length:",
-        len(BeautifulSoup(str(soup), "html.parser").get_text(" ", strip=True)),
-    )
-
-    # 3) 기타 광고 제거(선택자 기반)
     for ad in soup.select("[data-testid='ad'], .sponsor, .advertisement"):
         ad.decompose()
 
-    # 4) 브랜딩 치환 (Techpresso -> OneSip)
     _replace_brand_everywhere(soup, BRAND_FROM, BRAND_TO)
 
-    # 5) URL 텍스트 제거(링크는 유지)
     remove_visible_urls(soup)
-
-    # 6) 텍스트 노드 번역 (bold/strong은 제외)
     translate_text_nodes_inplace(soup)
-
-    # 7) 첫 기사 left-align 보정(가운데 밀림 방지)
     _ensure_first_issue_left_align(soup)
 
     out_html = str(soup)
 
-    # fallback: 본문이 너무 짧으면 제거 없이 다시 번역(단, 파트너/아카데미 삭제는 유지)
     text_len = len(BeautifulSoup(out_html, "html.parser").get_text(" ", strip=True))
     if text_len < 200:
         print("WARNING: HTML too small after cleanup. Falling back without header/footer removal.")
         soup2 = BeautifulSoup(html, "html.parser")
-
-        # ✅ fallback에서도 동일 적용
         _remove_partner_everything(soup2)
-
-        removed_academy2 = _remove_ai_academy_block_by_link(soup2)
-        if removed_academy2:
-            print("AI Academy block removed by link (fallback):", removed_academy2)
-
+        _remove_ai_academy_block_by_link(soup2)
         _remove_blocks_containing_keywords_safely(soup2, PARTNER_KEYWORDS)
         _remove_blocks_containing_keywords_safely(soup2, REMOVE_SECTION_KEYWORDS)
-
         for ad in soup2.select("[data-testid='ad'], .sponsor, .advertisement"):
             ad.decompose()
-
         _replace_brand_everywhere(soup2, BRAND_FROM, BRAND_TO)
         remove_visible_urls(soup2)
         translate_text_nodes_inplace(soup2)
         _ensure_first_issue_left_align(soup2)
-
         out_html = str(soup2)
 
     if DEBUG_DUMP_HTML:
@@ -831,17 +770,70 @@ def translate_html_preserve_layout(html: str, date_str: str) -> str:
             f.write(out_html)
         print("Wrote debug inner HTML:", f"debug_onesip_inner_{date_str}.html")
 
-    # ✅ DEBUG: 최종 반환 직전 길이 확인
-    print(
-        "Before return text length:",
-        len(BeautifulSoup(out_html, "html.parser").get_text(" ", strip=True)),
-    )
-
     return out_html
 
 
 # ======================
-# PDF용 HTML 래핑 + CSS (잘림 방지/여백/한글 폰트)
+# ✅ Daily 구조화(영문 원문) 추출
+# ======================
+def extract_structured_from_issue_html(raw_html: str) -> dict:
+    """
+    Techpresso issue HTML에서 기사/기타 섹션을 구조화해서 뽑는다.
+    - 번역 전(raw_html) 기준(영문 원문)으로 저장
+    - partner/academy/광고 제거 로직 재사용해서 데이터 깨끗하게 유지
+    """
+    soup = BeautifulSoup(raw_html, "html.parser")
+
+    _remove_techpresso_header_footer_safely(soup)
+    _remove_partner_everything(soup)
+    _remove_ai_academy_block_by_link(soup)
+    _remove_blocks_containing_keywords_safely(soup, REMOVE_SECTION_KEYWORDS)
+    _remove_blocks_containing_keywords_safely(soup, PARTNER_KEYWORDS)
+
+    issues = []
+    tables = soup.find_all("table")
+    for tbl in tables:
+        if not _table_looks_like_issue(tbl):
+            continue
+
+        td = tbl.find("td")
+        if not td:
+            continue
+
+        a = td.find("a", href=True)
+        title = td.get_text(" ", strip=True)
+        link = a["href"] if a else None
+
+        bullets = []
+        nxt = tbl.find_next_sibling()
+        if nxt and getattr(nxt, "name", None) == "ul":
+            for li in nxt.find_all("li"):
+                t = li.get_text(" ", strip=True)
+                if t:
+                    bullets.append(t)
+
+        if title and link:
+            issues.append({"title": title, "link": link, "bullets": bullets[:6]})
+
+    other_news = []
+    header_node = soup.find(string=lambda s: isinstance(s, str) and "Other news & articles you might like" in s)
+    if header_node:
+        container = header_node.find_parent()
+        if container:
+            for li in container.find_all_next("li", limit=80):
+                a = li.find("a", href=True)
+                txt = li.get_text(" ", strip=True)
+                if a and txt:
+                    cleaned = txt.replace("LINK", "").strip()
+                    other_news.append({"title": cleaned, "link": a["href"]})
+                if len(other_news) >= 40:
+                    break
+
+    return {"issues": issues, "other_news": other_news}
+
+
+# ======================
+# PDF용 HTML 래핑 + CSS
 # ======================
 def wrap_html_for_pdf(inner_html: str) -> str:
     css = """
@@ -918,13 +910,11 @@ def fetch_issue_html_by_offset():
     if not candidates:
         return None, None
 
-    # 1) 정확히 target_date와 일치하는 발행본 우선
     exact = [c for c in candidates if c[1] == target_date]
     if exact:
         exact.sort(key=lambda x: x[0], reverse=True)
         return exact[0][2], target_date
 
-    # 2) 없으면 target_date 이전(older) 중 가장 최신 fallback
     older = [c for c in candidates if c[1] < target_date]
     if older:
         older.sort(key=lambda x: x[0], reverse=True)
@@ -932,7 +922,6 @@ def fetch_issue_html_by_offset():
         print("No exact match. Fallback to older issue date (KST):", chosen_date)
         return chosen_html, chosen_date
 
-    # 3) 그래도 없으면 그냥 가장 최신(안전망)
     candidates.sort(key=lambda x: x[0], reverse=True)
     chosen_dt, chosen_date, chosen_html = candidates[0]
     print("No older match. Fallback to latest issue date (KST):", chosen_date)
@@ -1014,6 +1003,16 @@ def main():
 
     date_str = issue_date.strftime("%Y-%m-%d")
 
+    # ✅ Daily JSON 저장(영문 원문) + 2달 보관 정책
+    prune_daily_data(keep_days=KEEP_DAYS)
+    try:
+        structured = extract_structured_from_issue_html(raw_html)
+        save_daily_json(date_str, {"date": date_str, **structured})
+    except Exception as e:
+        # Daily PDF 발송이 main 목적이니, 저장 실패는 전체 실패로 만들지 않음
+        print("WARNING: failed to extract/save daily json:", e)
+
+    # 데일리 PDF는 기존대로 '번역본'으로 생성/발송
     translated_inner_html = translate_html_preserve_layout(raw_html, date_str)
 
     final_text_len = len(
