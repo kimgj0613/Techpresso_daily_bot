@@ -373,6 +373,10 @@ def _remove_ai_academy_block_by_link(soup: BeautifulSoup) -> int:
     anchors = soup.find_all("a", href=True)
 
     for a in anchors:
+        # 1. a가 None이거나 유효하지 않은 객체라면 건너넙니다.
+        if not a:
+            continue
+            
         href = a.get("href", "") or ""
         if "academy.techpresso.co" not in href:
             continue
